@@ -8,10 +8,11 @@ and queries firmware information — all over TCP/5033.
 
 Quick Start:
     python p2_scanner.py --pcap capture.pcapng                              # Learn network name
-    python p2_scanner.py --discover --range 10.0.0.0/24 --network MYBLN     # Find everything
-    python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
+    python p2_scanner.py --discover --range 10.1.1.0/24 --network MYBLN     # Find everything
+    python p2_scanner.py -n 10.1.1.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
+
 """
 
 import socket
@@ -953,11 +954,17 @@ def scan_device(host: str, device: str, points: Optional[List[str]] = None,
     conn = P2Connection(host, network=P2_NETWORK if P2_NETWORK else "P2NET",
                         scanner_name=SCANNER_NAME)
 
-    print(f"\n{'═' * 70}")
-    print(f"  P2 SCANNER — {device} on {node_name.upper()} ({host})")
-    if P2_NETWORK:
-        print(f"  Network: {P2_NETWORK}  |  Site: {P2_SITE or '?'}")
-    print(f"{'═' * 70}")
+    # When output_format="none", we're running as a step inside a larger
+    # sweep (e.g. building-wide room-temp read). Suppress per-device banners
+    # and progress chatter so the sweep can render a single combined table.
+    suppress_output = (output_format == "none")
+
+    if not suppress_output:
+        print(f"\n{'═' * 70}")
+        print(f"  P2 SCANNER — {device} on {node_name.upper()} ({host})")
+        if P2_NETWORK:
+            print(f"  Network: {P2_NETWORK}  |  Site: {P2_SITE or '?'}")
+        print(f"{'═' * 70}")
 
     if not conn.connect(node_name):
         return []
@@ -1054,8 +1061,9 @@ def scan_device(host: str, device: str, points: Optional[List[str]] = None,
     failed = 0
 
     for i, pt_name in enumerate(scan_list):
-        sys.stdout.write(f"\r  Scanning: {i+1}/{total} — {pt_name:<25s}")
-        sys.stdout.flush()
+        if not suppress_output:
+            sys.stdout.write(f"\r  Scanning: {i+1}/{total} — {pt_name:<25s}")
+            sys.stdout.flush()
 
         result = conn.read_point(device, pt_name, node_name)
         if result and result['value'] is not None:
@@ -1091,15 +1099,16 @@ def scan_device(host: str, device: str, points: Optional[List[str]] = None,
         time.sleep(0.05)
 
     conn.close()
-    print(f"\r  Scan complete: {success} points read, {failed} failed{'':30s}")
+    if not suppress_output:
+        print(f"\r  Scan complete: {success} points read, {failed} failed{'':30s}")
 
-    # Output results
-    if output_format == "table":
-        print_results_table(device, results)
-    elif output_format == "json":
-        print(json.dumps(results, indent=2))
-    elif output_format == "csv":
-        print_results_csv(results)
+        # Output results
+        if output_format == "table":
+            print_results_table(device, results)
+        elif output_format == "json":
+            print(json.dumps(results, indent=2))
+        elif output_format == "csv":
+            print_results_csv(results)
 
     return results
 
@@ -1372,6 +1381,89 @@ def print_results_csv(results: List[Dict]):
             r.get('comm_status', ''),
             r.get('description', ''),
         ])
+
+
+def _print_sweep_results(sweep_results: List[Dict], read_points: List,
+                         output_format: str = "table"):
+    """Render building-wide sweep output — results are flat, one row per
+    (node, device, point). Prints a single combined table/CSV/JSON.
+    Each result dict has '_node' and '_device' set from discover_network."""
+    if not sweep_results:
+        print("  No devices responded.")
+        return
+
+    if output_format == "json":
+        # JSON: pass through as-is for programmatic use
+        print(json.dumps(sweep_results, indent=2, default=str))
+        return
+
+    if output_format == "csv":
+        writer = csv.writer(sys.stdout)
+        writer.writerow(['node', 'device', 'description', 'point_slot',
+                         'point_name', 'value', 'value_text', 'units',
+                         'point_type', 'comm_status', 'error'])
+        for r in sweep_results:
+            writer.writerow([
+                r.get('_node', r.get('node', '')),
+                r.get('_device', r.get('device', '')),
+                r.get('_description', r.get('description', '')),
+                r.get('point_slot', ''),
+                r.get('point_name', ''),
+                r.get('value', ''),
+                r.get('value_text', ''),
+                r.get('units', ''),
+                r.get('point_type', ''),
+                r.get('comm_status', ''),
+                r.get('error', ''),
+            ])
+        return
+
+    # Table: grouped by node, then device
+    print(f"\n  {'Node':<8s} {'Device':<12s} {'Point':<22s} {'Value':>14s} {'Units':<8s}")
+    print(f"  {'─' * 8} {'─' * 12} {'─' * 22} {'─' * 14} {'─' * 8}")
+
+    prev_node = None
+    for r in sweep_results:
+        node = r.get('_node', r.get('node', '?'))
+        dev = r.get('_device', r.get('device', '?'))
+
+        # Insert blank line between nodes for readability
+        if prev_node and node != prev_node:
+            print()
+        prev_node = node
+
+        if 'error' in r:
+            print(f"  {node:<8s} {dev:<12s} {'(' + r['error'] + ')':<22s} "
+                  f"{'—':>14s} {'':<8s}")
+            continue
+
+        name = r.get('point_name', '?')
+        slot = r.get('point_slot')
+        if slot is not None:
+            name_display = f"({slot}) {name}"
+        else:
+            name_display = name
+
+        # Clip for width
+        if len(name_display) > 22:
+            name_display = name_display[:21] + "…"
+
+        val = r.get('value')
+        units = r.get('units', '') or ''
+
+        if val is None:
+            val_str = "—"
+        elif r.get('value_text'):
+            val_str = f"{r['value_text']} ({int(round(val))})"
+        elif val == int(val) and abs(val) < 100000:
+            val_str = f"{int(val)}"
+        else:
+            val_str = f"{val:.2f}"
+
+        if r.get('comm_status') == 'comm_fault':
+            val_str += " #COM"
+
+        print(f"  {node:<8s} {dev:<12s} {name_display:<22s} {val_str:>14s} {units:<8s}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2381,13 +2473,15 @@ def discover_panel_points(host: str, node_name: str) -> List[Dict]:
 def discover_network(ip_ranges: str = "10.0.0", scan_ports: bool = True,
                      scan_devices: bool = True, scan_panel: bool = False,
                      scan_info: bool = False, verify: str = None,
-                     read_all: bool = False, output_format: str = "table"):
+                     read_all: bool = False, output_format: str = "table",
+                     read_points: Optional[List[str]] = None):
     """
     Full network discovery:
     1. Port scan for P2 hosts (or use known nodes)
     2. Handshake each to learn node names
     3. Brute-force TEC device discovery on each node
-    4. Optionally read all points on every discovered device
+    4. Optionally read all points on every discovered device (read_all=True)
+       OR read specific points across all devices (read_points=["ROOM TEMP"])
     """
     print(f"\n{'═' * 70}")
     print(f"  P2 NETWORK DISCOVERY")
@@ -2528,6 +2622,67 @@ def discover_network(ip_ranges: str = "10.0.0", scan_ports: bool = True,
 
                 results = scan_device(ip, dev, quick=False, output_format=output_format)
                 all_devices[name].setdefault('point_data', {})[dev] = results
+
+    # Step 4b: Selective point read across every discovered device.
+    # This is the "quick building health check" mode — read specific points
+    # (by name or slot number) from every device without doing a full scan.
+    # Output is a single combined table sorted by node/device.
+    elif read_points and all_devices:
+        print(f"\n{'═' * 70}")
+        print(f"  BUILDING-WIDE READ — points: {', '.join(str(p) for p in read_points)}")
+        print(f"{'═' * 70}")
+
+        sweep_results = []  # flat list: one entry per (node, device, point)
+        total_devs = sum(len(ni['devices']) for ni in all_devices.values())
+        done = 0
+
+        for name in sorted(all_devices.keys()):
+            node_info = all_devices[name]
+            ip = node_info['ip']
+            devs = node_info['devices']
+
+            for dev_info in devs:
+                dev = dev_info['device']
+                desc = dev_info.get('description', '')
+                done += 1
+                sys.stdout.write(f"\r  Reading {done}/{total_devs} — {name}/{dev}           ")
+                sys.stdout.flush()
+
+                try:
+                    # output_format="none" suppresses per-device tables; we'll
+                    # render a single combined table at the end.
+                    dev_results = scan_device(ip, dev, points=list(read_points),
+                                              output_format="none")
+                except ScannerInputError as e:
+                    # Bad input stops the whole sweep — the user gave us a
+                    # slot/name that's invalid. Fail fast, same contract as
+                    # single-device scans.
+                    print(f"\n  [ERROR] {e}")
+                    return
+                except Exception as e:
+                    # Per-device exceptions (timeouts, auth) are logged and
+                    # skipped so one bad device doesn't kill the sweep.
+                    sweep_results.append({'node': name, 'device': dev,
+                                          'description': desc, 'error': str(e)})
+                    continue
+
+                if dev_results:
+                    for r in dev_results:
+                        r['_node'] = name
+                        r['_device'] = dev
+                        r['_description'] = desc
+                        sweep_results.append(r)
+                else:
+                    # Device unreachable or point not readable — record the miss
+                    sweep_results.append({'node': name, 'device': dev,
+                                          'description': desc,
+                                          'error': 'no data'})
+
+        # Clear progress line
+        sys.stdout.write("\r" + " " * 70 + "\r")
+
+        # Render combined output
+        _print_sweep_results(sweep_results, read_points, output_format)
 
     # Summary
     print(f"\n{'═' * 70}")
@@ -3366,6 +3521,7 @@ Known nodes: """ + ', '.join(f"{n}={ip}" for n, ip in sorted(KNOWN_NODES.items()
                 verify=verify_filter,
                 read_all=args.read_all,
                 output_format=args.format,
+                read_points=args.point,
             )
         if args.save and P2_NETWORK:
             save_config(args.save)
