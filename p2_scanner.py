@@ -12,7 +12,6 @@ Quick Start:
     python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
-Wire format reverse-engineered from PCAP captures and WCIS_Device.dll decompilation.
 """
 
 import socket
@@ -104,7 +103,7 @@ def load_config(filepath: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEC APPLICATION POINT DATABASES (Siemens Doc 125-5075)
+# TEC APPLICATION POINT DATABASES
 # ═══════════════════════════════════════════════════════════════════════════════
 # Each TEC has up to 99 subpoints. The point names are fixed per application.
 # Address 0 is reserved, 1-99 are subpoints.
@@ -224,7 +223,7 @@ SUPPLY_TEMP_POINT = {
 def get_point_table(application: int) -> Dict[int, tuple]:
     """Build the complete point table for a given TEC application number.
 
-    First tries to load from tecpoints.json (rich format from Tecpnts.dbf,
+    First tries to load from tecpoints.json (rich format,
     797 apps with PTYPE / slope / intercept / state labels).
     Falls back to legacy tecpnts.json (name/units/dtype tuples).
     Falls back to hardcoded tables for apps 2020-2027 if neither available.
@@ -397,7 +396,7 @@ _TECPNTS_DB = None
 def _load_tecpnts_db() -> Optional[Dict]:
     """Load the TEC point database.
 
-    Prefers tecpoints.json (rich format, built from Tecpnts.dbf with state
+    Prefers tecpoints.json (rich format, with state
     labels, slope/intercept, etc.). Falls back to legacy tecpnts.json.
     """
     import os
