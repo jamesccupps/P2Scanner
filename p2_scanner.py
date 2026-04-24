@@ -12,7 +12,7 @@ Quick Start:
     python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
-Wire format reverse-engineered from PCAP captures and WCIS_Device.dll decompilation.
+
 """
 
 import socket
