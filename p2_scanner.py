@@ -12,7 +12,7 @@ Quick Start:
     python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
-
+Wire format derived from protocol analysis of network captures.
 """
 
 import socket
@@ -121,7 +121,7 @@ def load_config(filepath: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEC APPLICATION POINT DATABASES (Siemens Doc 125-5075)
+# TEC APPLICATION POINT DEFINITIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 # Each TEC has up to 99 subpoints. The point names are fixed per application.
 # Address 0 is reserved, 1-99 are subpoints.
@@ -241,8 +241,8 @@ SUPPLY_TEMP_POINT = {
 def get_point_table(application: int) -> Dict[int, tuple]:
     """Build the complete point table for a given TEC application number.
 
-    First tries to load from tecpoints.json (rich format from Tecpnts.dbf,
-    797 apps with PTYPE / slope / intercept / state labels).
+    First tries to load from tecpoints.json (rich format with
+    797 apps — PTYPE / slope / intercept / state labels).
     Falls back to legacy tecpnts.json (name/units/dtype tuples).
     Falls back to hardcoded tables for apps 2020-2027 if neither available.
 
@@ -408,14 +408,14 @@ def render_point_value(value: float, info: Optional[Dict]) -> Tuple[str, str]:
     return (f"{value:.2f}", "")
 
 
-# Global cache for the full TEC point database
+# Global cache for the full TEC point definitions
 _TECPNTS_DB = None
 
 def _load_tecpnts_db() -> Optional[Dict]:
-    """Load the TEC point database.
+    """Load the TEC point definitions.
 
-    Prefers tecpoints.json (rich format, built from Tecpnts.dbf with state
-    labels, slope/intercept, etc.). Falls back to legacy tecpnts.json.
+    Prefers tecpoints.json (rich format, with state labels, slope/intercept,
+    etc.). Falls back to legacy tecpnts.json.
     """
     import os
     here = os.path.dirname(os.path.abspath(__file__))
@@ -467,8 +467,8 @@ class P2Message:
 
     # Opcode / marker constants (big-endian 16-bit opcodes live inside 0x33/0x34 payloads)
     OP_IDENTIFY        = 0x4640  # mid-session identity refresh
-    OP_READ_EXTENDED   = 0x0271  # point read (Insight/WCIS)
-    OP_READ_SHORT      = 0x0220  # point read (Desigo CC)
+    OP_READ_EXTENDED   = 0x0271  # point read (legacy-dialect clients)
+    OP_READ_SHORT      = 0x0220  # point read (modern-dialect clients)
     OP_WRITE_NOVALUE   = 0x0273  # ACK-only, unclear semantic (probe/reset?)
     OP_VALUE_PUSH      = 0x0274  # bidirectional: DCC->PXC virtual-write, or PXC->DCC COV
     OP_WRITE_QUALITY   = 0x0240  # PXC->DCC push with quality envelope (5034 only)
@@ -843,7 +843,7 @@ class P2Connection:
             # Keep the existing "return None on error" contract — callers check for None.
             return None
 
-        # Find the value block. Confirmed from pcap analysis against Desigo:
+        # Find the value block. Confirmed from protocol analysis:
         #
         # ALL valid responses have this layout in the value block region:
         #   [last point_name LP-string] [01 00 00] [7 metadata bytes] [4-byte float]
@@ -1005,7 +1005,7 @@ class P2Connection:
             i += 1
         return strings
 
-    # ── New opcodes reverse-engineered from multi-panel DCC-side captures ──
+    # ── Additional opcodes identified from multi-panel packet captures ──
 
     def read_system_info_compact(self, node_name: str = "node") -> Optional[Dict[str, Any]]:
         """Read panel model/firmware/build via opcode 0x010C (2-byte request).
@@ -1052,7 +1052,7 @@ class P2Connection:
         points (PPCL variables, scheduled points, global analogs) in addition to
         TEC-device points.
 
-        Request body framing (empirically verified from Desigo CC captures):
+        Request body framing (empirically verified from packet captures):
             09 81                   opcode
             00 00                   2-byte header
             01 00 01 2a             TLV: first filter, always "*"
@@ -1190,7 +1190,7 @@ class P2Connection:
         sensor with a quality register vs PPCL-computed variable vs Title-only
         panel entry).
 
-        SHAPE A — physical point with quality sentinel (e.g. AC04VV / VAV INLET):
+        SHAPE A — physical point with quality sentinel (real sensor value):
             [routing header]
             00 00
             01 00 LL <dev>              device name (often repeated 3x)
@@ -1201,7 +1201,7 @@ class P2Connection:
             01 00 LL <units>            units
 
         SHAPE B — PPCL-computed variable with value, no quality register
-                  (e.g. BLR.MIN.STPT / "BLR HW STPT MIN" / 100.00 DEG F on NODE11):
+                  (e.g. a computed setpoint returning a float in engineering units):
             [routing header]
             00 00
             01 00 LL <name>             point name (repeated 3x)
@@ -1211,7 +1211,7 @@ class P2Connection:
             00 00 00                    3-byte pad
             01 00 LL <units>            units
 
-        SHAPE C — "Title"-only panel entry (e.g. "AC04 Serves 4th Floor.Title"):
+        SHAPE C — "Title"-only panel entry (label-only, no value, no units):
             [routing header]
             00 00
             01 00 LL <fullname>         full point name (repeated)
@@ -1272,7 +1272,7 @@ class P2Connection:
 
         # Compound-name detection. Some panels return entries with TWO ASCII
         # name TLVs in a row at the top of the body (instead of one name + an
-        # empty-TLV separator). Example from NODE3:
+        # empty-TLV separator). Example:
         #     01 00 04 BCCW  01 00 07 DAY.NGT  02 00 02 00 00 ...
         # vs normal:
         #     01 00 07 BAY.OCC  01 00 00  02 00 02 00 00 ...
@@ -3483,7 +3483,7 @@ def discover_network(ip_ranges: str = "10.0.0", scan_ports: bool = True,
             print(f"\n  ⚠ Could not auto-learn the P2 network name.")
             print(f"    PXC controllers require the correct network name to respond.")
             print(f"    Use --network <NAME> to specify it.")
-            print(f"    Find it in Desigo CC under Field Networks, or in Insight.")
+            print(f"    Find it in your BAS front-end (often listed under Field Networks).")
             print(f"    Common formats: SITEBLN, SITEEBLN, SITE_BLN")
             print(f"\n    Example: p2_scanner.py --discover --range {ip_ranges} --network MYBLN")
             return
