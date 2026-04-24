@@ -79,10 +79,12 @@ from p2_gui_widgets import (  # noqa: E402
     LogPane,
     NodeTree,
     PointTable,
+    ProgramsWindow,
     ScanHistory,
     SinglePointDialog,
     SweepDialog,
     SweepResultsWindow,
+    WalkPointsWindow,
 )
 from p2_gui_workers import TaskRunner  # noqa: E402
 
@@ -257,6 +259,20 @@ class MainWindow:
             tree_btns, text="Firmware", command=self._query_firmware
         )
         self._firmware_btn.pack(side="left", padx=2, fill="x", expand=True)
+
+        # Secondary node operations: panel-wide walks that are potentially
+        # slow (10-30s on a busy panel), so given their own row so they're
+        # distinct from the snappy primary ops.
+        tree_btns2 = ttk.Frame(left)
+        tree_btns2.pack(side="top", fill="x", pady=(3, 0))
+        self._walk_btn = ttk.Button(
+            tree_btns2, text="Walk All Points", command=self._walk_all_points
+        )
+        self._walk_btn.pack(side="left", padx=2, fill="x", expand=True)
+        self._programs_btn = ttk.Button(
+            tree_btns2, text="PPCL Programs", command=self._dump_programs
+        )
+        self._programs_btn.pack(side="left", padx=2, fill="x", expand=True)
 
         # Right: device detail
         right = ttk.Frame(hpane, padding=(8, 0, 0, 0))
@@ -1192,12 +1208,139 @@ class MainWindow:
             return
         self.log.log(f"Querying firmware on {node['name']}…")
         self._set_busy(f"Firmware query: {node['name']}…")
+        # Try the newer 0x010C compact sysinfo first — returns more fields
+        # on PME1300-era firmware — and silently fall back to legacy 0x0100
+        # on older panels.
         self.runner.submit(
             ("firmware", node["name"]),
-            p2.get_node_info,
+            self._do_firmware_query,
             node["ip"],
             node["name"],
         )
+
+    @staticmethod
+    def _do_firmware_query(host: str, node_name: str) -> Optional[Dict]:
+        """Worker: try 0x010C first, fall back to 0x0100. Returns a dict
+        shaped for _on_firmware_done regardless of which opcode worked."""
+        net = p2.P2_NETWORK if p2.P2_NETWORK else "P2NET"
+        conn = p2.P2Connection(host, network=net, scanner_name=p2.SCANNER_NAME)
+        try:
+            if not conn.connect(node_name.lower()):
+                print(f"  Could not connect to {host} as {node_name}")
+                return None
+
+            # Newer panels: compact (0x010C) — returns model + firmware
+            # string + build_date + raw_strings list. More informative on
+            # PME1300-era firmware than legacy 0x0100.
+            compact = conn.read_system_info_compact(node_name.lower())
+            if compact:
+                result = {
+                    "model": compact.get("model", ""),
+                    "firmware": compact.get("firmware", ""),
+                    "build": compact.get("build_date", ""),
+                    "extra": "",
+                    "_source": "compact (0x010C)",
+                }
+                # Stick the full raw string list into 'extra' so the user
+                # sees everything the panel sent back, formatted compactly
+                rs = compact.get("raw_strings") or []
+                if rs and len(rs) > 3:
+                    result["extra"] = " | ".join(rs[3:7])[:80]
+                print(
+                    f"  Compact sysinfo: model={result['model']}  "
+                    f"firmware={result['firmware']}  "
+                    f"build={result['build']}"
+                )
+                return result
+            # Older panels: legacy sysinfo (0x0100)
+            print("  Compact sysinfo not supported; falling back to legacy 0x0100…")
+        finally:
+            conn.close()
+
+        # Legacy path: use the existing helper (opens its own connection)
+        legacy = p2.get_node_info(host, node_name)
+        if legacy:
+            legacy = dict(legacy)  # defensive copy
+            legacy["_source"] = "legacy (0x0100)"
+        return legacy
+
+    def _walk_all_points(self) -> None:
+        """Walk every point on the panel via 0x0981 cursor pagination.
+        Can take 10-30 seconds on a busy panel."""
+        node = self._require_node()
+        if not node or not self._check_busy():
+            return
+        if not messagebox.askyesno(
+            "Walk all points?",
+            f"This enumerates every point on {node['name']} — including "
+            "PPCL variables, schedule points, and global analogs.\n\n"
+            "It can take 10–30 seconds on a busy panel. Continue?",
+            parent=self.root,
+        ):
+            return
+        self.log.log(f"Walking all points on {node['name']}…")
+        self._set_busy(f"Walk points: {node['name']}…")
+        self.runner.submit(
+            ("walk_points", node["name"]),
+            self._do_walk_points,
+            node["ip"],
+            node["name"],
+        )
+
+    @staticmethod
+    def _do_walk_points(host: str, node_name: str) -> List[Dict]:
+        net = p2.P2_NETWORK if p2.P2_NETWORK else "P2NET"
+        conn = p2.P2Connection(host, network=net, scanner_name=p2.SCANNER_NAME)
+        try:
+            if not conn.connect(node_name.lower()):
+                print(f"  Could not connect to {host} as {node_name}")
+                return []
+            print(f"  Enumerating all points on {node_name}…")
+            entries = conn.enumerate_all_points(node_name.lower())
+            print(f"  Walk complete: {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} found")
+            return entries
+        finally:
+            conn.close()
+
+    def _dump_programs(self) -> None:
+        """Dump PPCL source code for every program on the panel."""
+        node = self._require_node()
+        if not node or not self._check_busy():
+            return
+        if not messagebox.askyesno(
+            "Dump PPCL programs?",
+            f"This reads every PPCL program's source from {node['name']}.\n\n"
+            "It can take 10–30 seconds on a busy panel. Continue?",
+            parent=self.root,
+        ):
+            return
+        self.log.log(f"Dumping PPCL programs on {node['name']}…")
+        self._set_busy(f"Dump programs: {node['name']}…")
+        self.runner.submit(
+            ("dump_programs", node["name"]),
+            self._do_dump_programs,
+            node["ip"],
+            node["name"],
+        )
+
+    @staticmethod
+    def _do_dump_programs(host: str, node_name: str) -> List[Dict]:
+        net = p2.P2_NETWORK if p2.P2_NETWORK else "P2NET"
+        conn = p2.P2Connection(host, network=net, scanner_name=p2.SCANNER_NAME)
+        try:
+            if not conn.connect(node_name.lower()):
+                print(f"  Could not connect to {host} as {node_name}")
+                return []
+            print(f"  Reading PPCL programs on {node_name}…")
+            programs = conn.read_programs(node_name.lower())
+            total_lines = sum(p.get("code", "").count("\n") for p in programs)
+            print(
+                f"  Dump complete: {len(programs)} program{'s' if len(programs) != 1 else ''}, "
+                f"{total_lines} total lines"
+            )
+            return programs
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # Device-level operations
@@ -1390,6 +1533,8 @@ class MainWindow:
             self._enum_btn,
             self._verify_btn,
             self._firmware_btn,
+            self._walk_btn,
+            self._programs_btn,
         ):
             btn.configure(state="disabled")
 
@@ -1403,7 +1548,10 @@ class MainWindow:
             results = self.point_table.results()
             self._csv_btn.configure(state="normal" if results else "disabled")
             self._json_btn.configure(state="normal" if results else "disabled")
-        for btn in (self._enum_btn, self._verify_btn, self._firmware_btn):
+        for btn in (
+            self._enum_btn, self._verify_btn, self._firmware_btn,
+            self._walk_btn, self._programs_btn,
+        ):
             btn.configure(state="normal")
 
     def _start_polling(self) -> None:
@@ -1494,6 +1642,10 @@ class MainWindow:
                 self._on_port_scan_done(task_id, payload)
             elif kind == "sweep":
                 self._on_sweep_done(task_id, payload)
+            elif kind == "walk_points":
+                self._on_walk_points_done(task_id, payload)
+            elif kind == "dump_programs":
+                self._on_dump_programs_done(task_id, payload)
         finally:
             self._clear_busy()
 
@@ -1529,15 +1681,157 @@ class MainWindow:
             )
             return
         self._firmware_cache[node_name] = info
+        # Build a clean summary line. Compact sysinfo gives us a build date;
+        # legacy doesn't.
+        parts = [f"model={info.get('model', '?')}"]
+        if info.get("firmware"):
+            parts.append(f"firmware={info['firmware']}")
+        if info.get("build"):
+            parts.append(f"build={info['build']}")
+        if info.get("extra"):
+            parts.append(f"extra={info['extra']}")
+        source = info.get("_source", "")
+        suffix = f"   [{source}]" if source else ""
         self.log.log(
-            f"{node_name}: model={info.get('model', '?')}   "
-            f"firmware={info.get('firmware', '?')}"
-            + (f"   extra={info['extra']}" if info.get("extra") else ""),
+            f"{node_name}: " + "   ".join(parts) + suffix,
             level="ok",
         )
         # If this is the currently selected node, update the subheader
         if self._current_node and self._current_node["name"] == node_name:
             self._on_select_node(self._current_node)
+
+    def _on_walk_points_done(
+        self, task_id: tuple, entries: List[Dict]
+    ) -> None:
+        node_name = task_id[1]
+        if not entries:
+            self.log.log(
+                f"Walk points on {node_name} returned no entries "
+                "— check handshake and PXC access",
+                level="warn",
+            )
+            return
+        self.log.log(
+            f"{node_name}: {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} walked",
+            level="ok",
+        )
+        WalkPointsWindow(
+            self.root,
+            node_name=node_name,
+            entries=entries,
+            on_export_csv=self._export_walk_csv,
+            on_export_json=self._export_walk_json,
+        )
+
+    def _on_dump_programs_done(
+        self, task_id: tuple, programs: List[Dict]
+    ) -> None:
+        node_name = task_id[1]
+        if not programs:
+            self.log.log(
+                f"No PPCL programs returned for {node_name} "
+                "(panel may not have any, or firmware doesn't support 0x0985)",
+                level="warn",
+            )
+            return
+        total_lines = sum(p.get("code", "").count("\n") for p in programs)
+        self.log.log(
+            f"{node_name}: {len(programs)} program(s), {total_lines} lines",
+            level="ok",
+        )
+        ProgramsWindow(
+            self.root,
+            node_name=node_name,
+            programs=programs,
+            on_export=self._export_programs,
+        )
+
+    # ------------------------------------------------------------------
+    # Walk / programs exports
+    # ------------------------------------------------------------------
+
+    def _export_walk_csv(
+        self, entries: List[Dict], node_name: str
+    ) -> None:
+        import csv as _csv_mod
+        from tkinter import filedialog
+        default = f"walk_{node_name}.csv"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export walk results (CSV)",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile=default,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="") as f:
+                w = _csv_mod.writer(f)
+                w.writerow(["device", "point", "value", "units", "description"])
+                for e in entries:
+                    w.writerow([
+                        e.get("device", ""),
+                        e.get("point", ""),
+                        "" if e.get("value") is None else e.get("value"),
+                        e.get("units", "") or "",
+                        e.get("description", "") or "",
+                    ])
+            self.log.log(f"Exported {len(entries)} entries → {path}", level="ok")
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
+
+    def _export_walk_json(
+        self, entries: List[Dict], node_name: str
+    ) -> None:
+        from tkinter import filedialog
+        default = f"walk_{node_name}.json"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export walk results (JSON)",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+            initialfile=default,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump(
+                    {"node": node_name, "entries": entries},
+                    f, indent=2, default=str,
+                )
+            self.log.log(f"Exported {len(entries)} entries → {path}", level="ok")
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
+
+    def _export_programs(
+        self, programs: List[Dict], node_name: str
+    ) -> None:
+        """Writes either a single .json archive or a folder of .ppcl files,
+        depending on what the user picks."""
+        from tkinter import filedialog
+        default = f"ppcl_{node_name}.json"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export PPCL programs (JSON)",
+            defaultextension=".json",
+            filetypes=[("JSON archive", "*.json"), ("All files", "*.*")],
+            initialfile=default,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump(
+                    {"node": node_name, "programs": programs},
+                    f, indent=2, default=str,
+                )
+            self.log.log(
+                f"Exported {len(programs)} program(s) → {path}", level="ok"
+            )
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc), parent=self.root)
 
     def _on_scan_done(self, task_id: tuple, results: List[Dict]) -> None:
         _, node_name, device_name = task_id

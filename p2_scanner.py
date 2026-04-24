@@ -8,11 +8,11 @@ and queries firmware information — all over TCP/5033.
 
 Quick Start:
     python p2_scanner.py --pcap capture.pcapng                              # Learn network name
-    python p2_scanner.py --discover --range 10.1.1.0/24 --network MYBLN     # Find everything
-    python p2_scanner.py -n 10.1.1.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
+    python p2_scanner.py --discover --range 10.0.0.0/24 --network MYBLN     # Find everything
+    python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
-
+Wire format reverse-engineered from PCAP captures and WCIS_Device.dll decompilation.
 """
 
 import socket
@@ -51,6 +51,19 @@ def _set_network(name: str):
 def _set_scanner_name(name: str):
     global SCANNER_NAME
     SCANNER_NAME = name
+
+
+# Status-byte error code lookup (see P2Connection._parse_read_response).
+# These are the u16 BE codes that follow the direction byte 0x05 in error responses.
+# Observed frequencies in multi-panel reference pcaps:
+#   0x0003 — object not found (dominant; fires on reads for points that don't exist
+#            on the target panel, e.g. BLN virtuals absent from this node's model)
+#   0x00AC — opcode not supported on this firmware revision
+# Populate more as they appear on the wire.
+_P2_STATUS_ERRORS = {
+    0x0003: 'not_found',
+    0x00AC: 'not_supported',
+}
 
 
 class ScannerInputError(ValueError):
@@ -104,7 +117,7 @@ def load_config(filepath: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEC APPLICATION POINT DATABASES
+# TEC APPLICATION POINT DATABASES (Siemens Doc 125-5075)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Each TEC has up to 99 subpoints. The point names are fixed per application.
 # Address 0 is reserved, 1-99 are subpoints.
@@ -224,7 +237,7 @@ SUPPLY_TEMP_POINT = {
 def get_point_table(application: int) -> Dict[int, tuple]:
     """Build the complete point table for a given TEC application number.
 
-    First tries to load from tecpoints.json (rich format,
+    First tries to load from tecpoints.json (rich format from Tecpnts.dbf,
     797 apps with PTYPE / slope / intercept / state labels).
     Falls back to legacy tecpnts.json (name/units/dtype tuples).
     Falls back to hardcoded tables for apps 2020-2027 if neither available.
@@ -397,7 +410,7 @@ _TECPNTS_DB = None
 def _load_tecpnts_db() -> Optional[Dict]:
     """Load the TEC point database.
 
-    Prefers tecpoints.json (rich format, with state
+    Prefers tecpoints.json (rich format, built from Tecpnts.dbf with state
     labels, slope/intercept, etc.). Falls back to legacy tecpnts.json.
     """
     import os
@@ -443,11 +456,41 @@ class P2Message:
     TYPE_DATA      = 0x33
     TYPE_HEARTBEAT = 0x34
 
-    # Data markers
-    MARKER_KEEPALIVE = b'\x46\x40'
-    MARKER_COV       = b'\x02\x74'
-    MARKER_READ      = b'\x02\x71'
-    MARKER_BROWSE    = b'\x42'
+    # Response direction byte (first byte of S2C payload)
+    DIR_REQUEST   = 0x00   # C2S
+    DIR_SUCCESS   = 0x01   # S2C success
+    DIR_ERROR     = 0x05   # S2C error (followed by u16 BE error code)
+
+    # Opcode / marker constants (big-endian 16-bit opcodes live inside 0x33/0x34 payloads)
+    OP_IDENTIFY        = 0x4640  # mid-session identity refresh
+    OP_READ_EXTENDED   = 0x0271  # point read (Insight/WCIS)
+    OP_READ_SHORT      = 0x0220  # point read (Desigo CC)
+    OP_WRITE_NOVALUE   = 0x0273  # ACK-only, unclear semantic (probe/reset?)
+    OP_VALUE_PUSH      = 0x0274  # bidirectional: DCC->PXC virtual-write, or PXC->DCC COV
+    OP_WRITE_QUALITY   = 0x0240  # PXC->DCC push with quality envelope (5034 only)
+    OP_ENUM_FLN        = 0x0986  # enumerate FLN devices
+    OP_ENUM_POINTS     = 0x0981  # enumerate all points (cursor-based)
+    OP_ENUM_PROGRAMS   = 0x0985  # enumerate PPCL programs — response carries source text
+    OP_SYSINFO         = 0x0100  # firmware / model (legacy)
+    OP_SYSINFO_COMPACT = 0x010C  # firmware / model (newer; 2-byte request)
+    OP_ROUTING_TABLE   = 0x4634  # BLN routing-table announce/push
+    OP_BULK_READ       = 0x4221  # bulk property read (preallocated 222-byte request)
+
+    # Byte-sequence markers used by pcap/stream scanners looking for these opcodes.
+    # Kept as raw bytes for fast substring search.
+    MARKER_KEEPALIVE    = b'\x46\x40'
+    MARKER_VALUE_PUSH   = b'\x02\x74'
+    MARKER_WRITE_QUAL   = b'\x02\x40'
+    MARKER_ROUTING_TBL  = b'\x46\x34'
+    MARKER_READ         = b'\x02\x71'
+    MARKER_BROWSE       = b'\x42'
+
+    # Back-compat alias — original doc called 0x0274 "COV notification".
+    # Reality (confirmed from dual-port captures): 0x0274 is bidirectional.
+    # On 5033 (DCC->PXC) it's a virtual-point write into the panel's model.
+    # On 5034 (PXC->DCC) it's the genuine unsolicited COV. Same opcode,
+    # direction-dependent semantic. Prefer MARKER_VALUE_PUSH for new code.
+    MARKER_COV = MARKER_VALUE_PUSH
 
     def __init__(self, msg_type: int, sequence: int, payload: bytes):
         self.msg_type = msg_type
@@ -509,7 +552,14 @@ class P2Connection:
         return True
 
     def _handshake(self, node_name: str) -> bool:
-        """Send keepalive heartbeat to establish P2 session with the controller."""
+        """Establish a P2 session via the 0x33 DATA + 0x4640 identity-block path.
+
+        Naming note: older comments called this a "keepalive" or "heartbeat." That's
+        a misnomer — the message type is TYPE_DATA (0x33), not TYPE_HEARTBEAT (0x34).
+        Real Desigo CC can use either path (explicit 0x2E CONNECT, or this 0x33-with-
+        identity-block form). Both work against PXC firmware; we use this one because
+        it's a single round-trip.
+        """
         seq = self._next_seq()
         net = self.network.encode('ascii')
         src = node_name.encode('ascii')
@@ -687,6 +737,30 @@ class P2Connection:
             'data_type': 'unknown',
         }
 
+        # ─── Status-byte error path (direction byte 0x05 + u16 BE error code after routing header)
+        # This handles the common "object not found" case that reads hit on BLN-sourced
+        # virtual points that don't exist on the target panel. Without this branch, the
+        # response falls through to the value-block scan below and returns None, which loses
+        # the distinction between "no response from PXC" and "PXC said no such point."
+        if payload and payload[0] == P2Message.DIR_ERROR:
+            # Advance past the 4 null-terminated routing-header strings
+            i = 1
+            nulls = 0
+            while i < len(payload) and nulls < 4:
+                if payload[i] == 0:
+                    nulls += 1
+                i += 1
+            if i + 2 <= len(payload):
+                err_code = struct.unpack('>H', payload[i:i+2])[0]
+                err_name = _P2_STATUS_ERRORS.get(err_code, f'unknown_0x{err_code:04X}')
+                result['error'] = {'code': err_code, 'name': err_name}
+                if hasattr(self, 'last_error'):
+                    self.last_error = (err_name, f'response status-byte error 0x{err_code:04X}')
+                if DEBUG_READS:
+                    print(f"    [DEBUG] PXC returned status-byte error: {err_name} (0x{err_code:04X})")
+            # Keep the existing "return None on error" contract — callers check for None.
+            return None
+
         # Find the value block. Confirmed from pcap analysis against Desigo:
         #
         # ALL valid responses have this layout in the value block region:
@@ -848,6 +922,414 @@ class P2Connection:
                         pass
             i += 1
         return strings
+
+    # ── New opcodes reverse-engineered from multi-panel DCC-side captures ──
+
+    def read_system_info_compact(self, node_name: str = "node") -> Optional[Dict[str, Any]]:
+        """Read panel model/firmware/build via opcode 0x010C (2-byte request).
+
+        Works on newer PXC firmware (PME1300 / V2.8.18-era). Falls back to the
+        legacy 0x0100 GetRevString externally via `get_node_info()` if this returns
+        None. Response carries three TLV strings followed by ~16 bytes of feature
+        flags, an embedded IdentifyBlock, and panel state fields.
+
+        Returns dict with 'model', 'firmware', 'build_date', 'node_number',
+        'raw_strings' — or None on failure.
+        """
+        seq = self._next_seq()
+        routing = self._build_routing(node_name)
+        body = struct.pack('>H', P2Message.OP_SYSINFO_COMPACT)
+        msg = P2Message(P2Message.TYPE_DATA, seq, routing + body)
+        if not self._send_message(msg):
+            return None
+        resp = self._recv_response(seq)
+        if resp is None or not resp.payload or resp.payload[0] == P2Message.DIR_ERROR:
+            return None
+        strings = self._extract_lp_strings(resp.payload)
+        # Drop anything that looks like a routing-header name
+        routing_set = {self.network, self.scanner_name, P2_SITE,
+                       node_name.upper(), node_name.lower()}
+        data_strings = [s for s in strings if s not in routing_set]
+        result = {
+            'model': data_strings[0].strip() if len(data_strings) > 0 else '?',
+            'firmware': data_strings[1] if len(data_strings) > 1 else '?',
+            'build_date': data_strings[2] if len(data_strings) > 2 else '',
+            'raw_strings': data_strings,
+        }
+        # Byte at offset ~0x68 of the response payload encodes the node number.
+        # Offset varies slightly by firmware; search for the NODE name TLV and
+        # back up 3 bytes.
+        # For now, caller can inspect raw_strings for reliability.
+        return result
+
+    def enumerate_all_points(self, node_name: str = "node",
+                             max_points: int = 10000) -> List[Dict[str, Any]]:
+        """Walk every point on the panel using opcode 0x0981 with cursor pagination.
+
+        0x0981 is more complete than 0x0986 (EnumerateFLN): it returns panel-internal
+        points (PPCL variables, scheduled points, global analogs) in addition to
+        TEC-device points.
+
+        Request body framing (empirically verified from Desigo CC captures):
+            09 81                   opcode
+            00 00                   2-byte header
+            01 00 01 2a             TLV: first filter, always "*"
+            01 00 01 2a             TLV: second filter, always "*"
+            00 00                   separator
+            01 00 LL <cursor>       TLV: cursor = previous response's device name,
+                                          or empty (len=0) on the first call
+            01 00 00                empty TLV trailer
+
+        Response structure (after routing header):
+            00 00                   2-byte header
+            01 00 LL <dev>          TLV: device name
+            01 00 00 04 00 02 00 00 metadata block
+            01 00 LL <dev>          TLV: device name (repeated)
+            01 00 00 00 01          metadata
+            01 00 LL <dev>          TLV: device name (repeated again)
+            01 00 00                separator
+            01 00 LL <point>        TLV: POINT name  <-- what we want
+            3f ff ff f7             quality sentinel
+            00 00 06                padding
+            <f32>                   value (float)
+            23 00 00                padding
+            01 00 LL <units>        TLV: units string
+            trailer...
+        """
+        results = []
+        cursor = b''   # empty on first call
+        seen_cursors = set()
+
+        for _ in range(max_points):
+            seq = self._next_seq()
+            routing = self._build_routing(node_name)
+            body = (struct.pack('>H', P2Message.OP_ENUM_POINTS) +
+                    b'\x00\x00' +
+                    b'\x01\x00\x01\x2a' +   # first filter = "*"
+                    b'\x01\x00\x01\x2a' +   # second filter = "*"
+                    b'\x00\x00' +
+                    b'\x01' + struct.pack('>H', len(cursor)) + cursor +
+                    b'\x01\x00\x00')
+            msg = P2Message(P2Message.TYPE_DATA, seq, routing + body)
+            if not self._send_message(msg):
+                break
+            resp = self._recv_response(seq)
+            if resp is None:
+                break
+            if resp.payload and resp.payload[0] == P2Message.DIR_ERROR:
+                break
+
+            # Parse response payload manually — the _extract_lp_strings helper
+            # over-returns because the device name is repeated 3x in the response.
+            parsed = self._parse_enum_points_response(resp.payload)
+            if parsed is None:
+                break
+            dev_name = parsed['device']
+            # Dedup by device name alone — the cursor only cares about device.
+            # A panel where point != device (e.g. AC04VV / VAV INLET) emits ONE entry
+            # per cursor advance; a panel where point == device (Title-style) also
+            # emits ONE entry. Either way the device name advances monotonically.
+            if dev_name in seen_cursors:
+                break   # cursor failed to advance — PXC exhausted list
+            seen_cursors.add(dev_name)
+            results.append(parsed)
+
+            # Advance cursor with the DEVICE name from this response
+            cursor = dev_name.encode('ascii')
+
+        return results
+
+        return results
+
+    @staticmethod
+    def _parse_enum_points_response(payload: bytes) -> Optional[Dict[str, Any]]:
+        """Extract {device, point, value, units} from a 0x0981 response payload.
+
+        Two response shapes observed:
+
+        SHAPE A — regular point (e.g. AC04VV / VAV INLET):
+            [routing header]
+            00 00
+            01 00 LL <dev>              device name
+            01 00 00 <meta>
+            01 00 LL <dev>              device (repeated 3x)
+            01 00 LL <dev>
+            01 00 00
+            01 00 LL <point>            POINT name (distinct from dev)
+            3F FF FF Fx ... <f32>       quality sentinel + value
+            01 00 LL <units>            units
+
+        SHAPE B — "Title"-style panel-level point (e.g. "AC04 Serves 4th Floor.Title"):
+            [routing header]
+            00 00
+            01 00 LL <fullname>         full point name (3x repeated)
+            01 00 LL <fullname>
+            01 00 LL <fullname>
+            01 00 00
+            01 00 LL <description>      human description (e.g. "Serves 4th flr")
+            <metadata — NO quality sentinel, NO f32 value>
+
+        Returns {'device', 'point', 'value', 'units'}. For SHAPE B, device == point
+        (the full name like "AC04 Serves 4th Floor.Title"), value=None, units holds
+        the description. The key invariant: device is always extractable and
+        suitable for use as the next cursor, which is what the walker needs.
+        """
+        # Skip routing header (4 null-terminated strings)
+        i = 1
+        nulls = 0
+        while i < len(payload) and nulls < 4:
+            if payload[i] == 0:
+                nulls += 1
+            i += 1
+        if i >= len(payload):
+            return None
+        body = payload[i:]
+
+        # Collect all TLVs (tag=0x01, u16 BE length, value)
+        tlvs = []
+        p = 0
+        while p + 3 <= len(body):
+            if body[p] == 0x01:
+                L = struct.unpack('>H', body[p+1:p+3])[0]
+                if 0 <= L < 256 and p + 3 + L <= len(body):
+                    tlvs.append((p, L, body[p+3:p+3+L]))
+                    p += 3 + L
+                    continue
+            p += 1
+
+        # First non-empty TLV is the device/primary name
+        dev = None
+        dev_positions = []
+        for pos, L, val in tlvs:
+            if L == 0:
+                continue
+            try:
+                s = val.decode('ascii')
+            except UnicodeDecodeError:
+                continue
+            if not s.isprintable():
+                continue
+            if dev is None:
+                dev = s
+            if s == dev:
+                dev_positions.append(pos)
+        if dev is None:
+            return None
+
+        # Next non-empty TLV after the last device repetition is either
+        # a point name (SHAPE A) or a description (SHAPE B).
+        # Heuristic: look for a quality sentinel 3F FF FF Fx in the body.
+        # If present, SHAPE A — extract point + value. If not, SHAPE B.
+        q_idx = -1
+        for p in range(len(body) - 4):
+            if body[p] == 0x3F and body[p+1] == 0xFF and body[p+2] == 0xFF:
+                q_idx = p
+                break
+
+        secondary = None       # for SHAPE A: point name. for SHAPE B: description.
+        secondary_pos = None
+        after_last_dev = (dev_positions[-1] + 3 + len(dev)) if dev_positions else 0
+        for pos, L, val in tlvs:
+            if pos <= after_last_dev or L == 0:
+                continue
+            try:
+                s = val.decode('ascii')
+            except UnicodeDecodeError:
+                continue
+            if not s.isprintable():
+                continue
+            if s == dev:
+                continue
+            # If there's a quality sentinel, the secondary must come BEFORE it (point name).
+            # If no sentinel, the first string after the dev repetitions is the description.
+            if q_idx >= 0 and pos > q_idx:
+                break
+            secondary = s
+            secondary_pos = pos
+            break
+
+        if q_idx >= 0:
+            # SHAPE A — read value from past the sentinel
+            value = None
+            for offset in (7, 4, 8):
+                if q_idx + offset + 4 <= len(body):
+                    try:
+                        candidate = struct.unpack('>f', body[q_idx+offset:q_idx+offset+4])[0]
+                        if -1e10 < candidate < 1e10 and candidate == candidate:
+                            value = candidate
+                            break
+                    except struct.error:
+                        continue
+            # Units = first ASCII TLV after the point (past quality sentinel)
+            units = ''
+            for pos, L, val in tlvs:
+                if L == 0 or pos <= q_idx:
+                    continue
+                try:
+                    s = val.decode('ascii')
+                except UnicodeDecodeError:
+                    continue
+                if s.isprintable() and s != dev and s != secondary:
+                    units = s.strip()
+                    break
+            return {'device': dev, 'point': secondary or dev,
+                    'value': value, 'units': units, 'description': ''}
+        else:
+            # SHAPE B — no value, no units; secondary is description. device == point.
+            return {'device': dev, 'point': dev, 'value': None,
+                    'units': '', 'description': (secondary or '').strip()}
+
+    def read_programs(self, node_name: str = "node",
+                      max_requests: int = 5000) -> List[Dict[str, Any]]:
+        """Enumerate PPCL programs via opcode 0x0985 — response carries source text.
+
+        The cursor protocol for 0x0985 is two-level:
+          1. Program name cursor (advances when a program is exhausted)
+          2. Line number cursor (advances within a program, 10 lines per chunk)
+
+        Request body format (different from 0x0981 — only ONE filter TLV):
+            09 85                   opcode
+            00 00                   2-byte header
+            01 00 01 2a             filter TLV = "*" (single, not double)
+            00 00                   separator
+            01 00 LL <program>      program name (empty string on first call)
+            NN NN                   u16 BE line number to fetch (0 on first call)
+
+        Response body format:
+            00 00                   separator
+            01 00 LL <program>      program name (PXC's current position)
+            01 00 06 <module_tag>   6-char module type (e.g. "ET    " "D     " "DT    ")
+            01 00 LL <source_chunk> PPCL source code chunk (one or more lines)
+            NN NN                   u16 BE next-line hint (where to resume)
+            HH                      has-more flag: 0x01=more of this program, 0x00=done
+            01 00 00 00             4-byte trailer
+
+        Termination: when we ask for a line past the end of the LAST program,
+        the PXC returns a 2-byte error body `00 03` (DIR_ERROR + code 0x0003).
+
+        Returns list of {'name': ..., 'module': ..., 'code': ...} with full source
+        text per program.
+        """
+        # Accumulate chunks per program name
+        by_program: Dict[str, Dict[str, Any]] = {}
+        prog_order: List[str] = []
+
+        current_name = b''   # empty on first call — PXC treats as "start"
+        current_line = 0
+        requests_made = 0
+        seen_states = set()
+
+        while requests_made < max_requests:
+            requests_made += 1
+            seq = self._next_seq()
+            routing = self._build_routing(node_name)
+            body = (struct.pack('>H', P2Message.OP_ENUM_PROGRAMS) +
+                    b'\x00\x00' +
+                    b'\x01\x00\x01\x2a' +                         # single filter "*"
+                    b'\x00\x00' +
+                    b'\x01' + struct.pack('>H', len(current_name)) + current_name +
+                    struct.pack('>H', current_line))              # u16 BE line number
+            msg = P2Message(P2Message.TYPE_DATA, seq, routing + body)
+            if not self._send_message(msg):
+                break
+            resp = self._recv_response(seq)
+            if resp is None:
+                break
+            if resp.payload and resp.payload[0] == P2Message.DIR_ERROR:
+                # PXC says no more programs — normal end-of-list termination.
+                break
+
+            parsed = self._parse_program_response(resp.payload)
+            if parsed is None:
+                break
+
+            prog = parsed['program']
+            module = parsed['module']
+            code_chunk = parsed['code']
+            next_line = parsed['next_line']
+
+            # Accumulate the code chunk into the program record
+            if prog not in by_program:
+                by_program[prog] = {'name': prog, 'module': module, 'code': ''}
+                prog_order.append(prog)
+            if code_chunk:
+                existing = by_program[prog]['code']
+                by_program[prog]['code'] = (existing + '\n' + code_chunk) if existing else code_chunk
+
+            # Always advance using what the PXC returned. The has_more flag's exact
+            # semantic was unreliable in captures (it can be 0 mid-program too), so
+            # we rely on the PXC returning 0x0003 to signal end-of-list.
+            next_name = prog.encode('ascii')
+
+            # Loop guard: if we've been at this exact (name, line) before, bail.
+            # Protects against a PXC that parks on a line without advancing.
+            state_key = (next_name, next_line)
+            if state_key in seen_states:
+                break
+            seen_states.add(state_key)
+
+            current_name = next_name
+            current_line = next_line
+
+        return [by_program[name] for name in prog_order]
+
+    @staticmethod
+    def _parse_program_response(payload: bytes) -> Optional[Dict[str, Any]]:
+        """Parse a 0x0985 response payload.
+
+        Returns {program, module, code, next_line, has_more} or None.
+        """
+        # Skip routing header
+        i = 1
+        nulls = 0
+        while i < len(payload) and nulls < 4:
+            if payload[i] == 0:
+                nulls += 1
+            i += 1
+        if i >= len(payload):
+            return None
+        body = payload[i:]
+
+        # Expect: 00 00, then 3 TLVs, then next_line(u16) + has_more(u8) + trailer
+        if len(body) < 2 or body[0:2] != b'\x00\x00':
+            return None
+
+        # Walk TLVs starting at offset 2
+        tlvs = []
+        p = 2
+        while p + 3 <= len(body):
+            if body[p] == 0x01:
+                L = struct.unpack('>H', body[p+1:p+3])[0]
+                if 0 <= L < 8192 and p + 3 + L <= len(body):
+                    tlvs.append((p, L, body[p+3:p+3+L]))
+                    p += 3 + L
+                    continue
+            break  # TLV section ended
+
+        if len(tlvs) < 3:
+            return None
+
+        try:
+            program = tlvs[0][2].decode('ascii').rstrip()
+            module = tlvs[1][2].decode('ascii').rstrip()
+            code = tlvs[2][2].decode('ascii', errors='replace').rstrip()
+        except UnicodeDecodeError:
+            return None
+
+        # Next 3 bytes after the 3 TLVs: next_line (u16 BE) + has_more (u8)
+        tail_start = p
+        if tail_start + 3 > len(body):
+            return None
+        next_line = struct.unpack('>H', body[tail_start:tail_start+2])[0]
+        has_more = body[tail_start+2] == 0x01
+
+        return {
+            'program': program,
+            'module': module,
+            'code': code,
+            'next_line': next_line,
+            'has_more': has_more,
+        }
 
     def browse_device(self, device: str, node_name: str = "node") -> Optional[Dict[str, Any]]:
         """
@@ -1147,7 +1629,11 @@ def scan_network(quick: bool = False) -> Dict[str, List[Dict]]:
 
 def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
     """
-    Parse a pcap/pcapng file and decode all P2 point data.
+    Parse a pcap/pcapng file and decode all P2 point data from both 5033 and 5034.
+    Surfaces:
+      - Point reads and COV notifications (0x0274) — as list of events
+      - BLN routing-table topology (0x4634) — printed as summary
+      - Unique panel list derived from routing headers
     Requires tshark to be installed.
     """
     import subprocess
@@ -1158,9 +1644,10 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
 
     result = subprocess.run([
         'tshark', '-r', pcap_file,
-        '-Y', 'tcp.port==5033 && data.data',
+        '-Y', '(tcp.port==5033 || tcp.port==5034) && data.data',
         '-T', 'fields',
         '-e', 'frame.number', '-e', 'ip.src', '-e', 'ip.dst',
+        '-e', 'tcp.srcport', '-e', 'tcp.dstport',
         '-e', 'data.data'
     ], capture_output=True, text=True)
 
@@ -1170,15 +1657,35 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
 
     ip_node = {}
     all_points = []
+    # Cross-panel topology observations — populated from 0x4634 routing tables
+    routing_tables = []  # [{'src_panel': ..., 'peers': [{'name': ..., 'cost': ...}]}]
+    cov_sources = collections.Counter() if 'collections' in dir() else {}
+    # Local fallback if collections wasn't imported at top level
+    try:
+        import collections as _coll
+        cov_sources = _coll.Counter()
+    except Exception:
+        cov_sources = {}
+
+    def _inc(d, k):
+        if hasattr(d, 'update') and isinstance(d, dict) and not hasattr(d, 'most_common'):
+            d[k] = d.get(k, 0) + 1
+        else:
+            d[k] += 1
 
     for line in result.stdout.strip().split('\n'):
         parts = line.split('\t')
-        if len(parts) < 4:
+        if len(parts) < 6:
             continue
 
         fnum, src, dst = int(parts[0]), parts[1], parts[2]
         try:
-            raw = bytes.fromhex(parts[3])
+            sport, dport = int(parts[3]), int(parts[4])
+        except ValueError:
+            continue
+        port_on_wire = 5033 if (dport == 5033 or sport == 5033) else 5034
+        try:
+            raw = bytes.fromhex(parts[5])
         except:
             continue
 
@@ -1199,15 +1706,37 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
 
             resp_flag = msg[12]
 
-            # Map node names from routing
+            # Map node names from routing headers
             lp = P2Connection._extract_lp_strings(msg[12:])
             routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE} | {s.split('|')[0] for s in [SCANNER_NAME] if '|' in s}
             for s in lp:
                 if s.upper().startswith('NODE') and s.upper() not in routing_set:
-                    remote_ip = dst if src != dst else src  # DCC server sends from its IP
+                    remote_ip = dst if src != dst else src
                     ip_node[remote_ip] = s.upper()
 
-            # Parse 0x0274 COV data
+            # ── 0x4634 routing-table push: extract BLN topology
+            rt_idx = msg.find(b'\x46\x34')
+            if rt_idx >= 14 and rt_idx < len(msg) - 20:
+                # Only process if it looks like a real routing-table body (not inside a float)
+                # Heuristic: preceded by end-of-routing-header null terminator within a few bytes
+                if b'\x00' in msg[max(12, rt_idx-2):rt_idx]:
+                    body = msg[rt_idx:]
+                    parsed = parse_routing_table(body)
+                    if parsed and parsed.get('entries'):
+                        src_panel = '?'
+                        # The source panel for a PXC->DCC routing push is in routing slot 4
+                        rh = _parse_routing_header(msg[12:])
+                        if rh:
+                            _, names, _ = rh
+                            src_panel = names[3] if len(names) >= 4 else '?'
+                        routing_tables.append({
+                            'src_panel': src_panel,
+                            'port': port_on_wire,
+                            'frame': fnum,
+                            'entries': parsed['entries'],
+                        })
+
+            # ── 0x0274 COV / value-push
             marker_idx = msg.find(b'\x02\x74')
             if marker_idx >= 0:
                 after = msg[marker_idx + 2:]
@@ -1217,24 +1746,40 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
                         try:
                             pt_name = after[7:7+name_len].decode('ascii')
                         except:
-                            continue
-                        if pt_name.isprintable():
+                            pt_name = None
+                        if pt_name and pt_name.isprintable():
                             val_area = after[7+name_len:]
                             value = None
+                            # Two value-block shapes: (a) immediate TLV marker with f32,
+                            # (b) second TLV string (device first) then f32 — PXC->DCC form.
                             if len(val_area) >= 7 and val_area[0:3] == b'\x01\x00\x00':
-                                value = struct.unpack('>f', val_area[3:7])[0]
+                                try:
+                                    value = struct.unpack('>f', val_area[3:7])[0]
+                                except struct.error:
+                                    pass
+                            elif len(val_area) >= 3 and val_area[0] == 0x01:
+                                # Skip the second TLV string, then read f32
+                                L2 = struct.unpack('>H', val_area[1:3])[0]
+                                if 3 + L2 + 4 <= len(val_area):
+                                    try:
+                                        value = struct.unpack('>f', val_area[3+L2:3+L2+4])[0]
+                                    except struct.error:
+                                        pass
 
-                            remote_ip = dst if src != dst else src  # DCC server sends from its IP
+                            remote_ip = dst if src != dst else src
                             node = ip_node.get(remote_ip, remote_ip)
+                            direction = 'pxc_to_dcc' if port_on_wire == 5034 else 'dcc_to_pxc'
                             all_points.append({
                                 'frame': fnum,
                                 'node': node,
                                 'point_name': pt_name,
                                 'value': value,
-                                'type': 'COV',
+                                'type': 'COV_PUSH' if direction == 'pxc_to_dcc' else 'VIRTUAL_WRITE',
+                                'direction': direction,
                             })
+                            _inc(cov_sources, node)
 
-            # Parse read responses (flag=1, has 3FFFFFxx)
+            # ── Read responses (flag=1, has 3FFFFFxx value-block signature)
             if resp_flag == 1:
                 flags_idx = -1
                 for i in range(12, len(msg) - 3):
@@ -1248,7 +1793,10 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
                     after_flags = msg[flags_idx + 3:]
                     if len(after_flags) >= 8 and len(data_strs) >= 2:
                         raw_val = after_flags[4:8]
-                        value = struct.unpack('>f', raw_val)[0]
+                        try:
+                            value = struct.unpack('>f', raw_val)[0]
+                        except struct.error:
+                            value = None
                         # Extract units
                         units = ''
                         for s in P2Connection._extract_lp_strings(after_flags[8:]):
@@ -1256,7 +1804,7 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
                                 units = s
                                 break
 
-                        remote_ip = dst if src != dst else src  # DCC server sends from its IP
+                        remote_ip = dst if src != dst else src
                         node = ip_node.get(remote_ip, remote_ip)
                         all_points.append({
                             'frame': fnum,
@@ -1270,6 +1818,31 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
                         })
 
     print(f"  Decoded {len(all_points)} point values")
+
+    # ── Topology summary from observed 0x4634 messages
+    if routing_tables:
+        # Merge all observed routing tables into a single unique peer list
+        all_peers = {}
+        for rt in routing_tables:
+            for entry in rt['entries']:
+                n = entry['name']
+                if n and n not in all_peers:
+                    all_peers[n] = entry['cost']
+        print(f"\n  ── BLN topology (from {len(routing_tables)} routing-table pushes) ──")
+        print(f"  {'Peer':<24} {'Cost':>8}")
+        for name, cost in sorted(all_peers.items()):
+            print(f"  {name:<24} {cost:>8}")
+
+    if cov_sources:
+        # Sort — works for Counter.most_common() or plain dict fallback
+        try:
+            top = cov_sources.most_common(10)
+        except AttributeError:
+            top = sorted(cov_sources.items(), key=lambda kv: -kv[1])[:10]
+        if top:
+            print(f"\n  ── COV / value pushes by source node ──")
+            for node, n in top:
+                print(f"  {node:<24} {n:>6} events")
 
     if output_format == "table" and all_points:
         # Group by node and device
@@ -3205,6 +3778,379 @@ def cold_discover_site(ranges: Optional[List[str]] = None,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Passive push-channel listener (TCP 5034) + related parsers
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# P2 is two-port peer-to-peer. PXCs open outbound TCP to supervisor:5034 at boot
+# and push asynchronous notifications there:
+#   0x0274 — COV notification (value changed on a TEC-device point)
+#   0x0240 — BLN-sourced virtual-point value report (device name is literally "NONE")
+#   0x4634 — BLN routing-table announcement
+# Supervisor's only job on 5034 is to ACK with a 39-byte routing-header reply.
+# Running this listener alongside a real DCC server will work, but expect the
+# real DCC to retry to panels that get confused by duplicate ACKs — use only on
+# a dedicated IP or during a maintenance window for passive reconnaissance.
+
+def _parse_routing_header(payload: bytes) -> Optional[Tuple[bytes, List[str]]]:
+    """Split P2 routing header off the payload.
+
+    Returns (direction_byte, [name1, name2, name3, name4]) and the remaining body,
+    or None on parse failure. The four names are:
+        [BLN, destination, BLN, source]  for DATA/HEARTBEAT messages
+        [BLN, sender, BLN, recipient]    for CONNECT/ANNOUNCE (order reversed)
+    Caller needs to know the message type to interpret which slot is which.
+    """
+    if not payload:
+        return None
+    dir_byte = payload[0:1]
+    names = []
+    i = 1
+    for _ in range(4):
+        j = payload.find(b'\x00', i)
+        if j < 0:
+            return None
+        try:
+            names.append(payload[i:j].decode('ascii'))
+        except UnicodeDecodeError:
+            return None
+        i = j + 1
+    return dir_byte, names, payload[i:]
+
+
+def _extract_tlv_strings(data: bytes) -> List[str]:
+    """Pull out TLV strings (tag=0x01, u16 BE length, ASCII value)."""
+    out = []
+    i = 0
+    while i + 3 <= len(data):
+        if data[i] == 0x01:
+            L = struct.unpack('>H', data[i + 1:i + 3])[0]
+            if 0 < L < 1024 and i + 3 + L <= len(data):
+                val = data[i + 3:i + 3 + L]
+                if all(32 <= b < 127 for b in val):
+                    try:
+                        out.append(val.decode('ascii'))
+                        i += 3 + L
+                        continue
+                    except UnicodeDecodeError:
+                        pass
+        i += 1
+    return out
+
+
+def parse_cov_notification(body: bytes) -> Optional[Dict[str, Any]]:
+    """Parse a 0x0274 COV/value-push body (payload AFTER the routing header).
+
+    Wire format (PXC->supervisor direction seen on 5034):
+        02 74 00 01 00 00               opcode + header
+        01 00 LL <device>               TLV: device name
+        01 00 LL <point>                TLV: point name
+        XX XX XX XX                     f32 BE value
+        00 ...                          trailer padding
+    """
+    if len(body) < 10 or body[0:2] != b'\x02\x74':
+        return None
+    strings = _extract_tlv_strings(body[6:])  # skip 02 74 00 01 00 00
+    if len(strings) < 2:
+        return None
+    device, point = strings[0], strings[1]
+    # Value is after the second TLV string. Find its end, then read 4 bytes.
+    ptr = 6
+    for s in strings[:2]:
+        ptr += 3 + len(s)   # 01 00 LL + value
+    value = None
+    if ptr + 4 <= len(body):
+        try:
+            value = struct.unpack('>f', body[ptr:ptr + 4])[0]
+        except struct.error:
+            pass
+    return {'device': device, 'point': point, 'value': value}
+
+
+def parse_write_with_quality(body: bytes) -> Optional[Dict[str, Any]]:
+    """Parse a 0x0240 WriteWithQuality body.
+
+    Wire format (PXC->supervisor only, 5034):
+        02 40
+        01 00 04 "NONE"                 TLV: device = literal "NONE"
+        00                              separator
+        3F FF FF FF                     wildcard / quality-default sentinel
+        00 00
+        01 00 LL <point>                TLV: point name
+        01 00 00 00 00                  empty TLVs
+        01 00 00 01 00 00
+        XX XX XX XX                     f32 BE value
+        00                              trailer
+    """
+    if len(body) < 20 or body[0:2] != b'\x02\x40':
+        return None
+    strings = _extract_tlv_strings(body)
+    if len(strings) < 2:
+        return None
+    device, point = strings[0], strings[1]
+    # Float sits somewhere in the trailer — find the last 4 bytes that decode
+    # to a plausibly-valued float (finite, |v| < 1e9).
+    value = None
+    for i in range(len(body) - 5, max(0, len(body) - 20), -1):
+        try:
+            v = struct.unpack('>f', body[i:i + 4])[0]
+            if -1e9 < v < 1e9 and v == v:   # finite, not NaN
+                # Require the float to look non-trivially non-zero to reduce false
+                # picks on padding zeros — unless this is genuinely a zero reading,
+                # in which case we fall back to the first-fit candidate.
+                if abs(v) > 1e-6:
+                    value = v
+                    break
+        except struct.error:
+            continue
+    if value is None:
+        # Accept zero if no non-zero candidate found
+        for i in range(max(0, len(body) - 20), len(body) - 3):
+            try:
+                v = struct.unpack('>f', body[i:i + 4])[0]
+                if v == 0.0:
+                    value = v
+                    break
+            except struct.error:
+                continue
+    return {'device': device, 'point': point, 'value': value}
+
+
+def parse_routing_table(body: bytes) -> Optional[Dict[str, Any]]:
+    """Parse a 0x4634 BLN routing-table push.
+
+    Wire format:
+        46 34 00 00 00 00 <u16 count?> 00 0E   ~10-byte header
+        (01 00 LL <name> 00 00 <u32 BE cost>)+
+        00 00 00 00                     terminator
+
+    Returns {'entries': [{'name': ..., 'cost': ...}, ...]}.
+    """
+    if len(body) < 10 or body[0:2] != b'\x46\x34':
+        return None
+    entries = []
+    i = 10  # skip 10-byte header; exact structure varies slightly by firmware
+    while i + 5 < len(body):
+        if body[i] == 0x01:
+            L = struct.unpack('>H', body[i + 1:i + 3])[0]
+            if 0 < L < 64 and i + 3 + L + 4 <= len(body):
+                name_bytes = body[i + 3:i + 3 + L]
+                try:
+                    name = name_bytes.decode('ascii')
+                except UnicodeDecodeError:
+                    i += 1
+                    continue
+                cost = struct.unpack('>I', body[i + 3 + L:i + 3 + L + 4])[0]
+                entries.append({'name': name, 'cost': cost})
+                i += 3 + L + 4
+                continue
+        i += 1
+    return {'entries': entries}
+
+
+def _build_ack_response(msg_type: int, seq: int, req_payload: bytes,
+                       supervisor_name: str, site_name: str) -> bytes:
+    """Build a 39-byte routing-header-only ACK (direction byte 0x01).
+
+    The ACK echoes the request's seq and swaps the destination/source names.
+    """
+    rh = _parse_routing_header(req_payload)
+    if rh is None:
+        return b''
+    _, names, _ = rh
+    # Slot 0=BLN, slot 1=dest(=us), slot 2=BLN, slot 3=src(=panel)
+    # For response: slot 1 becomes the panel (was src), slot 3 becomes us (was dest)
+    bln = names[0]
+    panel = names[3]
+    us = names[1]
+    body = (
+        b'\x01' +
+        bln.encode('ascii') + b'\x00' +
+        panel.encode('ascii') + b'\x00' +
+        bln.encode('ascii') + b'\x00' +
+        us.encode('ascii') + b'\x00'
+    )
+    return struct.pack('>III', 12 + len(body), msg_type, seq) + body
+
+
+def listen_for_push_notifications(port: int = 5034, duration: Optional[int] = None,
+                                  output_format: str = 'table',
+                                  output_file: Optional[str] = None,
+                                  ack_enabled: bool = True,
+                                  verbose: bool = False) -> None:
+    """Bind to TCP port (default 5034) and passively collect PXC push notifications.
+
+    Decodes:
+      - 0x0274 COV notifications → device/point/value events
+      - 0x0240 WriteWithQuality  → BLN virtual updates (device="NONE")
+      - 0x4634 Routing tables    → BLN topology dumps
+
+    Sends routing-header-only ACKs back to keep panels happy. Handles multiple
+    concurrent inbound connections via threading.
+
+    Args:
+        port: TCP port to bind (default 5034 — the P2 supervisor listen port).
+        duration: Seconds to listen; None runs until KeyboardInterrupt.
+        output_format: 'table' (human) or 'json' (one object per line, JSONL).
+        output_file: Path to write events; stdout if None.
+        ack_enabled: If False, don't ACK — useful if a real DCC is also listening
+                     and you want to avoid confusing panels. Panels may drop the
+                     connection after ~30s without ACKs.
+        verbose: Print connection/disconnection events.
+    """
+    import threading
+    import json as _json
+
+    out_lock = threading.Lock()
+    out_stream = open(output_file, 'a', buffering=1) if output_file else None
+
+    def emit(event: Dict):
+        line = (_json.dumps(event) if output_format == 'json'
+                else _format_event_line(event))
+        with out_lock:
+            if out_stream:
+                out_stream.write(line + '\n')
+            else:
+                print(line)
+
+    def handle_connection(csock: socket.socket, peer: Tuple[str, int]):
+        if verbose:
+            print(f"  [5034] connection from {peer[0]}:{peer[1]}")
+        buf = b''
+        try:
+            csock.settimeout(45)  # heartbeat interval is ~30s; give 45s before we give up
+            while True:
+                chunk = csock.recv(8192)
+                if not chunk:
+                    break
+                buf += chunk
+                # Parse as many complete P2 messages as we have
+                while len(buf) >= 12:
+                    total_len, msg_type, seq = struct.unpack('>III', buf[:12])
+                    if total_len < 12 or total_len > 65536:
+                        # Framing desync — discard and move on
+                        buf = b''
+                        break
+                    if len(buf) < total_len:
+                        break   # wait for more bytes
+                    raw_payload = buf[12:total_len]
+                    buf = buf[total_len:]
+
+                    event = {
+                        'peer': f'{peer[0]}:{peer[1]}',
+                        'msg_type': f'0x{msg_type:02X}',
+                        'seq': seq,
+                    }
+
+                    rh = _parse_routing_header(raw_payload)
+                    if rh:
+                        dir_byte, names, body = rh
+                        event['src_node'] = names[3] if len(names) > 3 else '?'
+                        event['bln'] = names[0] if names else '?'
+
+                        if msg_type in (P2Message.TYPE_DATA, P2Message.TYPE_HEARTBEAT) and body:
+                            op_bytes = body[:2]
+                            op = struct.unpack('>H', op_bytes)[0] if len(op_bytes) == 2 else None
+                            event['opcode'] = f'0x{op:04X}' if op is not None else '?'
+                            if op_bytes == P2Message.MARKER_VALUE_PUSH:
+                                parsed = parse_cov_notification(body)
+                                if parsed:
+                                    event['event'] = 'cov'
+                                    event.update(parsed)
+                            elif op_bytes == P2Message.MARKER_WRITE_QUAL:
+                                parsed = parse_write_with_quality(body)
+                                if parsed:
+                                    event['event'] = 'virtual_push'
+                                    event.update(parsed)
+                            elif op_bytes == P2Message.MARKER_ROUTING_TBL:
+                                parsed = parse_routing_table(body)
+                                if parsed:
+                                    event['event'] = 'routing_table'
+                                    event['peer_count'] = len(parsed.get('entries', []))
+                                    event['entries'] = parsed['entries']
+                            else:
+                                event['event'] = 'unknown_opcode'
+                        elif msg_type in (P2Message.TYPE_CONNECT, P2Message.TYPE_ANNOUNCE):
+                            event['event'] = 'connect' if msg_type == P2Message.TYPE_CONNECT else 'announce'
+
+                    if 'event' in event:
+                        emit(event)
+
+                    # Send ACK
+                    if ack_enabled:
+                        ack = _build_ack_response(msg_type, seq, raw_payload,
+                                                   SCANNER_NAME, P2_SITE)
+                        if ack:
+                            try:
+                                csock.sendall(ack)
+                            except socket.error:
+                                pass
+        except (socket.timeout, socket.error, ConnectionResetError):
+            pass
+        finally:
+            try:
+                csock.close()
+            except Exception:
+                pass
+            if verbose:
+                print(f"  [5034] disconnect {peer[0]}:{peer[1]}")
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('0.0.0.0', port))
+    srv.listen(32)
+    srv.settimeout(1.0)
+
+    print(f"  Listening on TCP {port} for P2 push notifications...")
+    print(f"  Scanner identity: {SCANNER_NAME}  |  BLN: {P2_NETWORK or '(not set)'}")
+    print(f"  {'Press Ctrl+C to stop' if duration is None else f'Running for {duration}s'}")
+    print()
+
+    start = time.time()
+    threads = []
+    try:
+        while True:
+            if duration is not None and (time.time() - start) >= duration:
+                break
+            try:
+                csock, peer = srv.accept()
+            except socket.timeout:
+                continue
+            t = threading.Thread(target=handle_connection, args=(csock, peer), daemon=True)
+            t.start()
+            threads.append(t)
+    except KeyboardInterrupt:
+        print("\n  Stopped.")
+    finally:
+        srv.close()
+        if out_stream:
+            out_stream.close()
+
+
+def _format_event_line(event: Dict) -> str:
+    """One-line human-readable rendering of a push event."""
+    ts = time.strftime('%H:%M:%S')
+    src = event.get('src_node', '?')
+    ev = event.get('event', 'unknown')
+    if ev == 'cov':
+        return (f"{ts}  COV    {src:<12}  {event.get('device', ''):<14}  "
+                f"{event.get('point', ''):<20}  "
+                f"{event.get('value', '?'):>10}")
+    if ev == 'virtual_push':
+        return (f"{ts}  VIRT   {src:<12}  {'(panel)':<14}  "
+                f"{event.get('point', ''):<20}  "
+                f"{event.get('value', '?'):>10}")
+    if ev == 'routing_table':
+        names = [e['name'] for e in event.get('entries', [])]
+        return (f"{ts}  ROUTE  {src:<12}  peers={event.get('peer_count', 0)}  "
+                f"[{', '.join(names[:5])}" +
+                (f", +{len(names)-5} more]" if len(names) > 5 else ']'))
+    if ev in ('connect', 'announce'):
+        return f"{ts}  {ev.upper():<6} {src:<12}  (session identity)"
+    return (f"{ts}  {ev:<6} {src:<12}  "
+            f"msg_type={event.get('msg_type', '?')} op={event.get('opcode', '?')}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -3316,6 +4262,30 @@ Known nodes: """ + ', '.join(f"{n}={ip}" for n, ip in sorted(KNOWN_NODES.items()
     parser.add_argument('--show-app', type=int, help='Show point table for TEC application')
     parser.add_argument('--port', type=int, default=P2_PORT, help=f'P2 port (default: {P2_PORT})')
 
+    # ── New capabilities (5034 listener, 0x010C/0x0981/0x0985 opcodes) ──
+    parser.add_argument('--listen-push', nargs='?', const=0, type=int, metavar='SECONDS',
+                        help='Bind to TCP 5034 and collect PXC push notifications '
+                             '(COV events, BLN virtual updates, routing tables). '
+                             'No SECONDS = run until Ctrl+C.')
+    parser.add_argument('--listen-port', type=int, default=5034,
+                        help='Port for --listen-push (default: 5034)')
+    parser.add_argument('--listen-output', metavar='FILE',
+                        help='Write captured events to FILE (default: stdout)')
+    parser.add_argument('--listen-no-ack', action='store_true',
+                        help="Don't ACK incoming pushes (safer if a real DCC is "
+                             "also on the network)")
+    parser.add_argument('--walk-points', action='store_true',
+                        help='Use opcode 0x0981 to enumerate every point on a '
+                             'panel (more complete than 0x0986 FLN enumerate). '
+                             'Requires -n NODE.')
+    parser.add_argument('--dump-programs', action='store_true',
+                        help='Use opcode 0x0985 to read PPCL program source from a '
+                             'panel. Requires -n NODE.')
+    parser.add_argument('--sysinfo-compact', action='store_true',
+                        help='Use opcode 0x010C (newer firmware) for panel info. '
+                             'Complements --info which uses legacy 0x0100. '
+                             'Requires -n NODE.')
+
     args = parser.parse_args()
 
     # Load site config if specified (optional — file doesn't need to exist yet)
@@ -3360,6 +4330,19 @@ Known nodes: """ + ', '.join(f"{n}={ip}" for n, ip in sorted(KNOWN_NODES.items()
             print(f"\n  Saved to {args.save}")
         elif result:
             print(f"\n  To save: rerun with --save site.json")
+        return
+
+    # ─── Passive 5034 listener — doesn't need the network name; extracts identity
+    #     from incoming packets. Runs in its own event loop until Ctrl+C or duration.
+    if args.listen_push is not None:
+        listen_for_push_notifications(
+            port=args.listen_port,
+            duration=args.listen_push if args.listen_push > 0 else None,
+            output_format='json' if args.format == 'json' else 'table',
+            output_file=args.listen_output,
+            ack_enabled=not args.listen_no_ack,
+            verbose=args.debug_reads,
+        )
         return
 
     # Check if we have what we need for P2 communication
@@ -3539,6 +4522,79 @@ Known nodes: """ + ', '.join(f"{n}={ip}" for n, ip in sorted(KNOWN_NODES.items()
         host = KNOWN_NODES.get(args.node.upper(), args.node)
     else:
         parser.print_help()
+        return
+
+    # ── New opcode-based operations (require -n NODE) ──
+    if args.sysinfo_compact:
+        node_name = args.node.upper() if args.node.upper() in KNOWN_NODES else args.node
+        print(f"\n  Compact sysinfo for {node_name} ({host}) via opcode 0x010C...")
+        conn = P2Connection(host)
+        if conn.connect(node_name.lower()):
+            info = conn.read_system_info_compact(node_name.lower())
+            conn.close()
+            if info:
+                print(f"  Model:      {info['model']}")
+                print(f"  Firmware:   {info['firmware']}")
+                print(f"  Build date: {info['build_date']}")
+                if args.format == 'json':
+                    print(json.dumps(info, indent=2))
+            else:
+                print(f"  No response (panel may not support 0x010C — try --info for legacy 0x0100)")
+        else:
+            print(f"  Could not connect to {host}")
+        return
+
+    if args.walk_points:
+        node_name = args.node.upper() if args.node.upper() in KNOWN_NODES else args.node
+        print(f"\n  Walking all points on {node_name} ({host}) via opcode 0x0981...")
+        conn = P2Connection(host)
+        if not conn.connect(node_name.lower()):
+            print(f"  Could not connect to {host}")
+            return
+        points = conn.enumerate_all_points(node_name.lower())
+        conn.close()
+        print(f"  Found {len(points)} points")
+        if args.format == 'json':
+            print(json.dumps(points, indent=2, default=str))
+        elif args.format == 'csv':
+            print("device,point,value,units,description")
+            for p in points:
+                v = '' if p.get('value') is None else f"{p['value']:g}"
+                desc = p.get('description', '').replace(',', ';')
+                print(f"{p['device']},{p['point']},{v},{p.get('units', '')},{desc}")
+        else:
+            print(f"\n  {'Device':<28} {'Point':<22} {'Value':>10} {'Units':<8} {'Description':<24}")
+            print(f"  {'-'*28} {'-'*22} {'-'*10} {'-'*8} {'-'*24}")
+            for p in points:
+                v = '' if p.get('value') is None else f"{p['value']:g}"
+                desc = p.get('description', '')
+                print(f"  {p['device']:<28.28} {p['point']:<22.22} {v:>10} "
+                      f"{p.get('units', ''):<8.8} {desc:<24.24}")
+        return
+
+    if args.dump_programs:
+        node_name = args.node.upper() if args.node.upper() in KNOWN_NODES else args.node
+        print(f"\n  Reading PPCL programs from {node_name} ({host}) via opcode 0x0985...")
+        conn = P2Connection(host)
+        if not conn.connect(node_name.lower()):
+            print(f"  Could not connect to {host}")
+            return
+        programs = conn.read_programs(node_name.lower())
+        conn.close()
+        total_lines = sum(p['code'].count('\n') + 1 for p in programs if p.get('code'))
+        print(f"  Found {len(programs)} programs, ~{total_lines} total source lines\n")
+        if args.format == 'json':
+            print(json.dumps(programs, indent=2))
+        else:
+            for p in programs:
+                print(f"  {'='*72}")
+                module_str = f" [{p['module']}]" if p.get('module') else ''
+                print(f"  PROGRAM: {p['name']}{module_str}")
+                print(f"  {'='*72}")
+                # Indent the code two spaces for readability; preserve blank lines
+                for line in p.get('code', '').split('\n'):
+                    print(f"    {line}")
+                print()
         return
 
     # Device scan

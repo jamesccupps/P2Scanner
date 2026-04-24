@@ -1517,8 +1517,11 @@ HELP_SECTIONS: List[Tuple[str, str]] = [
           "so you can tell at a glance what you're connected to."),
 
     ("h2", "2. Working with nodes"),
-    ("p", "The left tree shows ⌬ BLN → node → device. Clicking a node selects it; "
-          "the three buttons below the tree act on the selected node:"),
+    ("p", "The left tree shows ⌬ BLN → node → device. Clicking a node "
+          "selects it; the buttons below the tree act on the selected "
+          "node. The primary row holds snappy operations; the secondary "
+          "row (Walk All Points, PPCL Programs) holds slower panel-wide "
+          "reads — see section 5."),
     ("li", "Enumerate FLN — asks the PXC to list every device on its FLN "
            "bus (opcode 0x0986). Populates the tree. Fast."),
     ("li", "Verify Online — reads ROOM TEMP on every enumerated device to "
@@ -1527,7 +1530,7 @@ HELP_SECTIONS: List[Tuple[str, str]] = [
            "Offline devices take ~6 seconds each on the wire; this is "
            "the PXC's own timeout and can't be shortened."),
     ("li", "Firmware — queries the PXC's model, firmware version, and build "
-           "(opcode 0x0100). Appears in the detail panel header."),
+           "date. Covered in detail in section 5."),
 
     ("h2", "3. Reading points on a single device"),
     ("p", "Select a device in the tree, then use the detail panel on the right:"),
@@ -1603,6 +1606,31 @@ HELP_SECTIONS: List[Tuple[str, str]] = [
            "just what's filtered)."),
     ("li", "Double-click any row — selects that device in the main tree "
            "so you can drill in with Scan All / Read Point."),
+
+    ("h2", "5. Panel-wide reads (Walk / Programs / Firmware)"),
+    ("p", "The row of buttons below the tree — Walk All Points, PPCL "
+          "Programs, Firmware — operate on a whole PXC panel rather than "
+          "a single device. Walk and Programs can take 10–30 seconds on a "
+          "busy panel, so each prompts for confirmation before running."),
+    ("li", "Firmware — queries the PXC for its model, firmware version, "
+           "and build date. The GUI first tries the newer 0x010C compact "
+           "sysinfo opcode (richer output on PME1300-era panels, includes "
+           "a build date) and transparently falls back to legacy 0x0100 "
+           "on older firmware. The log line tells you which opcode worked."),
+    ("li", "Walk All Points — enumerates every point the PXC knows about "
+           "via opcode 0x0981. This is more complete than Enumerate FLN: "
+           "it includes PPCL variables, schedule points, global analogs, "
+           "and panel-level Title entries alongside the FLN device points. "
+           "Results open in a window with a sortable Device / Point / "
+           "Value / Units / Description table, a filter box, and a 'Hide "
+           "title entries' toggle. Export as CSV or JSON."),
+    ("li", "PPCL Programs — dumps the full PPCL source text of every "
+           "program on the PXC via opcode 0x0985. Opens a master-detail "
+           "view: program list on the left (name, module tag, line count), "
+           "read-only monospace source on the right. A find bar "
+           "highlights every match in the current program. Comment lines "
+           "(lines tagged 'C' in PPCL convention) render in green. Export "
+           "all programs as a JSON archive."),
 
     ("h2", "6. Scan history (View → Scan History…)"),
     ("p", "Every scan and sweep you run this session is archived in memory "
@@ -2287,3 +2315,439 @@ class CompareWindow(tk.Toplevel):
                 values=(node, dev, pt, bv, av, delta, change_str),
                 tags=tuple(tags),
             )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WALK ALL POINTS WINDOW
+# ═══════════════════════════════════════════════════════════════════════════
+
+class WalkPointsWindow(tk.Toplevel):
+    """Results viewer for conn.enumerate_all_points() — the full panel walk
+    via 0x0981 which includes FLN devices plus panel-internal PPCL
+    variables, scheduled points, global analogs, and Title entries.
+
+    Two row shapes come back in the same list:
+      * Regular:  {device, point, value, units, description=''}
+      * Title:    {device==point, value=None, units='', description='label'}
+    """
+
+    COLUMNS = (
+        ("device", "Device", 180, "w"),
+        ("point",  "Point", 220, "w"),
+        ("value",  "Value", 110, "e"),
+        ("units",  "Units", 70,  "center"),
+        ("desc",   "Description / Title", 280, "w"),
+    )
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        node_name: str,
+        entries: List[Dict],
+        on_export_csv: Optional[Callable] = None,
+        on_export_json: Optional[Callable] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.title(f"All Points — {node_name}")
+        self.minsize(760, 440)
+        self._parent = parent
+
+        self._entries = list(entries)
+        self._node_name = node_name
+
+        # Header
+        header = ttk.Frame(self, padding=(12, 10))
+        header.pack(fill="x")
+        ttk.Label(
+            header,
+            text=f"Panel-wide point walk: {node_name}",
+            font=("", 11, "bold"),
+        ).pack(anchor="w")
+
+        n_total = len(entries)
+        n_titles = sum(
+            1 for e in entries
+            if e.get("value") is None and e.get("description")
+        )
+        n_points = n_total - n_titles
+        summary_parts = [f"{n_total} entr{'ies' if n_total != 1 else 'y'}"]
+        if n_points:
+            summary_parts.append(
+                f"{n_points} point read{'s' if n_points != 1 else ''}"
+            )
+        if n_titles:
+            summary_parts.append(
+                f"{n_titles} title entr{'ies' if n_titles != 1 else 'y'}"
+            )
+        ttk.Label(
+            header, text="  ·  ".join(summary_parts), foreground="#555"
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Toolbar
+        toolbar = ttk.Frame(self, padding=(12, 0, 12, 6))
+        toolbar.pack(fill="x")
+        if on_export_csv:
+            ttk.Button(
+                toolbar, text="Export CSV…",
+                command=lambda: on_export_csv(self._entries, self._node_name),
+            ).pack(side="left", padx=2)
+        if on_export_json:
+            ttk.Button(
+                toolbar, text="Export JSON…",
+                command=lambda: on_export_json(self._entries, self._node_name),
+            ).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(
+            side="left", fill="y", padx=10
+        )
+        ttk.Label(toolbar, text="Filter:").pack(side="left", padx=(0, 4))
+        self._filter_var = tk.StringVar()
+        self._filter_var.trace_add("write", lambda *a: self._render())
+        ttk.Entry(toolbar, textvariable=self._filter_var, width=24).pack(side="left")
+
+        self._hide_titles_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            toolbar,
+            text="Hide title entries",
+            variable=self._hide_titles_var,
+            command=self._render,
+        ).pack(side="left", padx=(12, 0))
+
+        ttk.Button(toolbar, text="Close", command=self.destroy).pack(side="right", padx=2)
+
+        # Table
+        body = ttk.Frame(self, padding=(12, 0, 12, 10))
+        body.pack(fill="both", expand=True)
+        keys = [c[0] for c in self.COLUMNS]
+        self._tree = ttk.Treeview(body, columns=keys, show="headings")
+        for key, label, width, anchor in self.COLUMNS:
+            self._tree.heading(
+                key, text=label, command=lambda k=key: self._sort_by(k)
+            )
+            self._tree.column(
+                key, width=width, anchor=anchor,
+                stretch=(key in ("point", "desc")),
+            )
+        sby = ttk.Scrollbar(body, orient="vertical", command=self._tree.yview)
+        sbx = ttk.Scrollbar(body, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscrollcommand=sby.set, xscrollcommand=sbx.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        sby.grid(row=0, column=1, sticky="ns")
+        sbx.grid(row=1, column=0, sticky="ew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        # Title entries get a faint background so they read as labels
+        # rather than values
+        self._tree.tag_configure(
+            "title", background="#f5f0e8", foreground="#6a5020"
+        )
+
+        self._sort_key = "device"
+        self._sort_reverse = False
+        self._render()
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        _center_on_parent(self, self._parent, width=980, height=560)
+
+    def _sort_by(self, key: str) -> None:
+        if key == self._sort_key:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_key = key
+            self._sort_reverse = False
+        self._render()
+
+    def _render(self) -> None:
+        for iid in self._tree.get_children():
+            self._tree.delete(iid)
+
+        filter_text = self._filter_var.get().strip().lower()
+        hide_titles = self._hide_titles_var.get()
+
+        def is_title(e: Dict) -> bool:
+            return (
+                e.get("value") is None
+                and bool(e.get("description"))
+            )
+
+        def sort_key(e: Dict):
+            k = self._sort_key
+            if k == "device":
+                return (e.get("device", ""),)
+            if k == "point":
+                return (e.get("point", ""),)
+            if k == "value":
+                v = e.get("value")
+                if v is None:
+                    return (float("inf"),)
+                try:
+                    return (float(v),)
+                except (TypeError, ValueError):
+                    return (float("inf"),)
+            if k == "units":
+                return (e.get("units", ""),)
+            if k == "desc":
+                return (e.get("description", ""),)
+            return ("",)
+
+        rows = sorted(
+            self._entries, key=sort_key, reverse=self._sort_reverse
+        )
+
+        for e in rows:
+            title = is_title(e)
+            if hide_titles and title:
+                continue
+
+            device = e.get("device", "") or ""
+            point = e.get("point", "") or ""
+            raw = e.get("value")
+            units = e.get("units", "") or ""
+            desc = e.get("description", "") or ""
+
+            if raw is None:
+                value_str = "—"
+            else:
+                try:
+                    f = float(raw)
+                    value_str = f"{f:.0f}" if abs(f - round(f)) < 0.01 else f"{f:.2f}"
+                except (TypeError, ValueError):
+                    value_str = str(raw)
+
+            if filter_text:
+                haystack = " ".join(
+                    str(x).lower() for x in (device, point, value_str, units, desc)
+                )
+                if filter_text not in haystack:
+                    continue
+
+            tags = ("title",) if title else ()
+            self._tree.insert(
+                "", "end",
+                values=(device, point, value_str, units, desc),
+                tags=tags,
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PPCL PROGRAMS WINDOW
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ProgramsWindow(tk.Toplevel):
+    """Master-detail viewer for conn.read_programs() — PPCL source dumps.
+
+    Left: program list (name + module tag). Right: read-only monospace
+    source. Includes an in-source find bar for searching the currently-
+    selected program.
+    """
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        node_name: str,
+        programs: List[Dict],
+        on_export: Optional[Callable] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.title(f"PPCL Programs — {node_name}")
+        self.minsize(700, 420)
+        self._parent = parent
+
+        self._programs = list(programs)
+        self._node_name = node_name
+
+        # Header
+        header = ttk.Frame(self, padding=(12, 10))
+        header.pack(fill="x")
+        ttk.Label(
+            header,
+            text=f"PPCL source: {node_name}",
+            font=("", 11, "bold"),
+        ).pack(anchor="w")
+        total_lines = sum(p.get("code", "").count("\n") for p in programs)
+        ttk.Label(
+            header,
+            text=f"{len(programs)} program{'s' if len(programs) != 1 else ''}"
+                 f"  ·  {total_lines} total lines",
+            foreground="#555",
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Toolbar
+        toolbar = ttk.Frame(self, padding=(12, 0, 12, 6))
+        toolbar.pack(fill="x")
+        if on_export:
+            ttk.Button(
+                toolbar, text="Export All…",
+                command=lambda: on_export(self._programs, self._node_name),
+            ).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(
+            side="left", fill="y", padx=10
+        )
+        ttk.Label(toolbar, text="Find in source:").pack(side="left", padx=(0, 4))
+        self._find_var = tk.StringVar()
+        self._find_var.trace_add("write", lambda *a: self._find_in_source())
+        find_entry = ttk.Entry(toolbar, textvariable=self._find_var, width=24)
+        find_entry.pack(side="left")
+        ttk.Button(toolbar, text="Next", command=self._find_next).pack(
+            side="left", padx=(4, 0)
+        )
+        ttk.Button(toolbar, text="Close", command=self.destroy).pack(
+            side="right", padx=2
+        )
+
+        # Split body: list | source
+        body = ttk.Panedwindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        # Left: program list
+        left = ttk.Frame(body)
+        body.add(left, weight=1)
+        cols = ("name", "module", "lines")
+        self._prog_tree = ttk.Treeview(
+            left, columns=cols, show="headings", selectmode="browse"
+        )
+        self._prog_tree.heading("name", text="Program")
+        self._prog_tree.heading("module", text="Module")
+        self._prog_tree.heading("lines", text="Lines")
+        self._prog_tree.column("name", width=160, anchor="w")
+        self._prog_tree.column("module", width=60, anchor="center")
+        self._prog_tree.column("lines", width=55, anchor="e")
+        psb = ttk.Scrollbar(left, orient="vertical", command=self._prog_tree.yview)
+        self._prog_tree.configure(yscrollcommand=psb.set)
+        self._prog_tree.grid(row=0, column=0, sticky="nsew")
+        psb.grid(row=0, column=1, sticky="ns")
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        self._prog_tree.bind(
+            "<<TreeviewSelect>>", lambda _e: self._on_select_program()
+        )
+
+        # Right: source text
+        right = ttk.Frame(body)
+        body.add(right, weight=3)
+
+        try:
+            import tkinter.font as tkfont
+            mono_family = "Consolas" if "Consolas" in tkfont.families() else "Courier"
+        except Exception:
+            mono_family = "Courier"
+
+        self._source = tk.Text(
+            right,
+            wrap="none",
+            font=(mono_family, 10),
+            bg="#fcfcf8",
+            fg="#222",
+            padx=10,
+            pady=8,
+            borderwidth=0,
+        )
+        ssy = ttk.Scrollbar(right, orient="vertical", command=self._source.yview)
+        ssx = ttk.Scrollbar(right, orient="horizontal", command=self._source.xview)
+        self._source.configure(yscrollcommand=ssy.set, xscrollcommand=ssx.set)
+        self._source.grid(row=0, column=0, sticky="nsew")
+        ssy.grid(row=0, column=1, sticky="ns")
+        ssx.grid(row=1, column=0, sticky="ew")
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self._source.tag_configure(
+            "search_hit", background="#ffe58a", foreground="#222"
+        )
+        self._source.tag_configure(
+            "comment", foreground="#0b7"
+        )
+
+        # Populate program list
+        self._iid_to_idx: Dict[str, int] = {}
+        for i, prog in enumerate(self._programs):
+            name = prog.get("name", "?")
+            mod = prog.get("module", "") or ""
+            code = prog.get("code", "") or ""
+            lines = code.count("\n") + (0 if code.endswith("\n") or not code else 1)
+            iid = self._prog_tree.insert(
+                "", "end", values=(name, mod, lines)
+            )
+            self._iid_to_idx[iid] = i
+
+        self._source.configure(state="disabled")
+
+        # Auto-select first program
+        first = self._prog_tree.get_children()
+        if first:
+            self._prog_tree.selection_set(first[0])
+            self._prog_tree.focus(first[0])
+            # Call the handler directly — the <<TreeviewSelect>> event from
+            # selection_set() fires asynchronously, so if the caller opens
+            # the window and immediately queries the source text it'd be
+            # empty. Populate it synchronously here.
+            self._on_select_program()
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        _center_on_parent(self, self._parent, width=940, height=600)
+
+    def _on_select_program(self) -> None:
+        sel = self._prog_tree.selection()
+        if not sel:
+            return
+        idx = self._iid_to_idx.get(sel[0])
+        if idx is None:
+            return
+        prog = self._programs[idx]
+        self._source.configure(state="normal")
+        self._source.delete("1.0", "end")
+        code = prog.get("code", "") or "(empty program)"
+        self._source.insert("1.0", code)
+
+        # Faint coloring for PPCL comment lines (start with 'C ' after the
+        # line number, or are the bare 'C' filler)
+        self._source.tag_remove("comment", "1.0", "end")
+        line_count = int(self._source.index("end-1c").split(".")[0])
+        for ln in range(1, line_count + 1):
+            line = self._source.get(f"{ln}.0", f"{ln}.end")
+            stripped = line.strip()
+            # PPCL convention: "NNNN    C <comment>" or "NNNN    C"
+            parts = stripped.split(None, 2)
+            if len(parts) >= 2 and parts[1].upper() == "C":
+                self._source.tag_add("comment", f"{ln}.0", f"{ln}.end")
+
+        self._source.configure(state="disabled")
+        self._source.yview_moveto(0)
+        # Re-apply any active find
+        self._find_in_source()
+
+    def _find_in_source(self) -> None:
+        """Highlight all occurrences of the find-text in the current source."""
+        self._source.configure(state="normal")
+        try:
+            self._source.tag_remove("search_hit", "1.0", "end")
+            needle = self._find_var.get()
+            if not needle:
+                return
+            start = "1.0"
+            while True:
+                pos = self._source.search(needle, start, "end", nocase=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(needle)}c"
+                self._source.tag_add("search_hit", pos, end)
+                start = end
+        finally:
+            self._source.configure(state="disabled")
+
+    def _find_next(self) -> None:
+        """Scroll to the next search hit past the current view."""
+        needle = self._find_var.get()
+        if not needle:
+            return
+        current_top = self._source.index("@0,0")
+        # Search from after current_top; wrap to start if nothing found
+        pos = self._source.search(
+            needle, f"{current_top}+1c", "end", nocase=True
+        )
+        if not pos:
+            pos = self._source.search(needle, "1.0", "end", nocase=True)
+        if pos:
+            self._source.see(pos)
