@@ -12,7 +12,7 @@ Quick Start:
     python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
-Wire format reverse-engineered from PCAP captures and WCIS_Device.dll decompilation.
+
 """
 
 import socket
@@ -117,7 +117,7 @@ def load_config(filepath: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEC APPLICATION POINT DATABASES (Siemens Doc 125-5075)
+# TEC APPLICATION POINT DATABASES
 # ═══════════════════════════════════════════════════════════════════════════════
 # Each TEC has up to 99 subpoints. The point names are fixed per application.
 # Address 0 is reserved, 1-99 are subpoints.
@@ -237,7 +237,7 @@ SUPPLY_TEMP_POINT = {
 def get_point_table(application: int) -> Dict[int, tuple]:
     """Build the complete point table for a given TEC application number.
 
-    First tries to load from tecpoints.json (rich format from Tecpnts.dbf,
+    First tries to load from tecpoints.json (rich format,
     797 apps with PTYPE / slope / intercept / state labels).
     Falls back to legacy tecpnts.json (name/units/dtype tuples).
     Falls back to hardcoded tables for apps 2020-2027 if neither available.
@@ -410,7 +410,7 @@ _TECPNTS_DB = None
 def _load_tecpnts_db() -> Optional[Dict]:
     """Load the TEC point database.
 
-    Prefers tecpoints.json (rich format, built from Tecpnts.dbf with state
+    Prefers tecpoints.json (rich format, built with state
     labels, slope/intercept, etc.). Falls back to legacy tecpnts.json.
     """
     import os
@@ -1026,7 +1026,7 @@ class P2Connection:
                 break
             dev_name = parsed['device']
             # Dedup by device name alone — the cursor only cares about device.
-            # A panel where point != device (e.g. AC04VV / VAV INLET) emits ONE entry
+            # A panel where point != device (e.g. ACVV / VAV INLET) emits ONE entry
             # per cursor advance; a panel where point == device (Title-style) also
             # emits ONE entry. Either way the device name advances monotonically.
             if dev_name in seen_cursors:
@@ -1047,7 +1047,7 @@ class P2Connection:
 
         Two response shapes observed:
 
-        SHAPE A — regular point (e.g. AC04VV / VAV INLET):
+        SHAPE A — regular point (e.g. ACVV / VAV INLET):
             [routing header]
             00 00
             01 00 LL <dev>              device name
@@ -1059,18 +1059,18 @@ class P2Connection:
             3F FF FF Fx ... <f32>       quality sentinel + value
             01 00 LL <units>            units
 
-        SHAPE B — "Title"-style panel-level point (e.g. "AC04 Serves 4th Floor.Title"):
+        SHAPE B — "Title"-style panel-level point (e.g. "AC24 Serves 24th Floor.Title"):
             [routing header]
             00 00
             01 00 LL <fullname>         full point name (3x repeated)
             01 00 LL <fullname>
             01 00 LL <fullname>
             01 00 00
-            01 00 LL <description>      human description (e.g. "Serves 4th flr")
+            01 00 LL <description>      human description (e.g. "Serves 24th flr")
             <metadata — NO quality sentinel, NO f32 value>
 
         Returns {'device', 'point', 'value', 'units'}. For SHAPE B, device == point
-        (the full name like "AC04 Serves 4th Floor.Title"), value=None, units holds
+        (the full name like "AC24 Serves 24th Floor.Title"), value=None, units holds
         the description. The key invariant: device is always extractable and
         suitable for use as the next cursor, which is what the walker needs.
         """
