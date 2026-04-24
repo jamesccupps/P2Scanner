@@ -132,6 +132,22 @@ class MainWindow:
         self._load_config_if_present()
         self._start_polling()
 
+        # Note on first-connect latency for users new to this build. The
+        # scanner auto-detects legacy vs modern PXC wire dialect; modern
+        # panels add ~2s to the very first connect while it probes. After
+        # that it's cached for the session. Keeping this concise — a
+        # 3-line info blurb, not a wall.
+        self.log.log(
+            "Scanner supports both legacy (PME1252) and modern "
+            "(PME1300) PXC firmware.",
+            level="info",
+        )
+        self.log.log(
+            "First connect to a modern panel may take ~2s extra while "
+            "the dialect is probed; subsequent connects are fast.",
+            level="info",
+        )
+
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------
@@ -922,6 +938,20 @@ class MainWindow:
             self.log.log(
                 f"Reopened sweep from {self._format_ts(entry['timestamp'])}: "
                 f"{', '.join(entry['points'])}",
+                level="info",
+            )
+        elif entry["kind"] == "walk":
+            # Reopen a historical walk in a fresh WalkPointsWindow
+            WalkPointsWindow(
+                self.root,
+                node_name=entry["node"],
+                entries=list(entry["entries"]),
+                on_export_csv=self._export_walk_csv,
+                on_export_json=self._export_walk_json,
+            )
+            self.log.log(
+                f"Reopened walk of {entry['node']} from "
+                f"{self._format_ts(entry['timestamp'])}",
                 level="info",
             )
 
@@ -1715,6 +1745,10 @@ class MainWindow:
             f"{node_name}: {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} walked",
             level="ok",
         )
+        # Archive so the user can diff walks across time (useful for
+        # tracking panel changes: "what came and went between yesterday
+        # and today"). Symmetric with how regular scans are archived.
+        self.scan_history.add_walk(node=node_name, entries=entries)
         WalkPointsWindow(
             self.root,
             node_name=node_name,
@@ -1768,10 +1802,11 @@ class MainWindow:
         try:
             with open(path, "w", newline="") as f:
                 w = _csv_mod.writer(f)
-                w.writerow(["device", "point", "value", "units", "description"])
+                w.writerow(["device", "subkey", "point", "value", "units", "description"])
                 for e in entries:
                     w.writerow([
                         e.get("device", ""),
+                        e.get("subkey", "") or "",
                         e.get("point", ""),
                         "" if e.get("value") is None else e.get("value"),
                         e.get("units", "") or "",

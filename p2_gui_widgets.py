@@ -1621,9 +1621,17 @@ HELP_SECTIONS: List[Tuple[str, str]] = [
            "via opcode 0x0981. This is more complete than Enumerate FLN: "
            "it includes PPCL variables, schedule points, global analogs, "
            "and panel-level Title entries alongside the FLN device points. "
-           "Results open in a window with a sortable Device / Point / "
-           "Value / Units / Description table, a filter box, and a 'Hide "
-           "title entries' toggle. Export as CSV or JSON."),
+           "Results open in a window with a sortable Device / Subkey / "
+           "Point / Value / Units / Description table, a filter box, and "
+           "a 'Hide title entries' toggle. Export as CSV or JSON. Walks "
+           "are also archived in session history, so you can diff two "
+           "walks of the same panel across time to see what came and "
+           "went."),
+    ("p", "Subkeys: some PXC points use a compound identity — two name "
+          "fields (e.g. BCCW / DAY.NGT) where a normal point has one. "
+          "The Subkey column is the second field, empty for normal "
+          "points. When diffing walks, entries are matched by (device, "
+          "subkey, point) so compound entries don't collide."),
     ("li", "PPCL Programs — dumps the full PPCL source text of every "
            "program on the PXC via opcode 0x0985. Opens a master-detail "
            "view: program list on the left (name, module tag, line count), "
@@ -1631,6 +1639,12 @@ HELP_SECTIONS: List[Tuple[str, str]] = [
            "highlights every match in the current program. Comment lines "
            "(lines tagged 'C' in PPCL convention) render in green. Export "
            "all programs as a JSON archive."),
+    ("p", "Firmware-dialect note: the scanner auto-detects whether a PXC "
+          "speaks the legacy (PME1252-era) or modern (PME1300/AAS) P2 "
+          "wire dialect. If you used an earlier version and some panels "
+          "seemed unreachable, they should now respond. The first connect "
+          "to a modern panel is about 2 seconds slower while the dialect "
+          "is probed; subsequent connects are fast. Nothing to configure."),
 
     ("h2", "6. Scan history (View → Scan History…)"),
     ("p", "Every scan and sweep you run this session is archived in memory "
@@ -1664,6 +1678,12 @@ HELP_SECTIONS: List[Tuple[str, str]] = [
           "you can skip probes entirely with --listen 60 (passive listen "
           "for BLN multicast announcements). See the main p2_scanner "
           "README for the full flag list and safety notes."),
+    ("p", "Caveat — cold-discover uses legacy-dialect probes only. On an "
+          "all-modern greenfield site (everything PME1300 / AAS), cold "
+          "discovery may fail to fingerprint anything. Workaround: if you "
+          "know any one panel IP in advance, point the scanner directly "
+          "at it with -n NODEx — that path does auto-detect the dialect "
+          "correctly."),
     ("p", "Once cold-discover has written a site.json, come back to the "
           "GUI and use File → Load Config… to pick it up."),
 
@@ -1847,6 +1867,24 @@ class ScanHistory:
         self._entries.append(entry)
         return entry
 
+    def add_walk(
+        self,
+        node: str,
+        entries: List[Dict],
+    ) -> Dict:
+        """Record a Walk All Points run on a single PXC."""
+        import time
+        entry = {
+            "id": self._next_id,
+            "kind": "walk",
+            "timestamp": time.time(),
+            "node": node,
+            "entries": [dict(e) for e in entries],  # defensive copy
+        }
+        self._next_id += 1
+        self._entries.append(entry)
+        return entry
+
     def all(self) -> List[Dict]:
         return list(self._entries)
 
@@ -1899,6 +1937,19 @@ def _summarize_entry(entry: Dict) -> Tuple[str, str, str, str]:
         detail = f"{n} point{'s' if n != 1 else ''}"
         if app:
             detail += f"  ·  app {app}"
+    elif entry["kind"] == "walk":
+        kind_label = "Walk points"
+        target_label = entry.get("node", "?")
+        entries = entry.get("entries", [])
+        n_total = len(entries)
+        n_titles = sum(
+            1 for e in entries
+            if e.get("value") is None and e.get("description")
+        )
+        n_points = n_total - n_titles
+        detail = f"{n_points} point{'s' if n_points != 1 else ''}"
+        if n_titles:
+            detail += f"  ·  {n_titles} title{'s' if n_titles != 1 else ''}"
     else:  # sweep
         kind_label = "Sweep"
         target_label = ", ".join(entry.get("points", []))
@@ -2141,6 +2192,9 @@ class CompareWindow(tk.Toplevel):
         elif e1["kind"] == "sweep":
             if set(e1.get("points", [])) != set(e2.get("points", [])):
                 return False, "different point sets — row matching disabled"
+        elif e1["kind"] == "walk":
+            if e1.get("node") != e2.get("node"):
+                return False, "different nodes — row matching disabled"
         return True, "same target"
 
     def _build_table(self) -> None:
@@ -2152,7 +2206,11 @@ class CompareWindow(tk.Toplevel):
             cols = ("slot", "name", "before", "after", "delta", "change")
             labels = ("Slot", "Point Name", "Before", "After", "Δ", "Change")
             widths = (60, 180, 140, 140, 80, 80)
-        else:
+        elif self._entry_before["kind"] == "walk":
+            cols = ("device", "subkey", "point", "before", "after", "delta", "change")
+            labels = ("Device", "Subkey", "Point", "Before", "After", "Δ", "Change")
+            widths = (140, 80, 180, 130, 130, 80, 80)
+        else:  # sweep
             cols = ("node", "device", "point", "before", "after", "delta", "change")
             labels = ("Node", "Device", "Point", "Before", "After", "Δ", "Change")
             widths = (90, 120, 160, 130, 130, 80, 80)
@@ -2242,8 +2300,58 @@ class CompareWindow(tk.Toplevel):
 
         if self._entry_before["kind"] == "device":
             self._render_device(changed_only)
+        elif self._entry_before["kind"] == "walk":
+            self._render_walk(changed_only)
         else:
             self._render_sweep(changed_only)
+
+    def _render_walk(self, changed_only: bool) -> None:
+        """Diff two Walk All Points runs on the same node. Entries are keyed
+        by (device, subkey, point) — the subkey disambiguates compound-name
+        entries where the same device has multiple records (e.g. BCCW has
+        one entry per PPCL variable attached to it)."""
+
+        def key(e: Dict) -> Tuple[str, str, str]:
+            return (
+                e.get("device", "") or "",
+                e.get("subkey", "") or "",
+                e.get("point", "") or "",
+            )
+
+        def as_result(e: Dict) -> Dict:
+            # Walk entries use 'value'/'units' keys like scan results,
+            # so they feed _format_value and _delta directly.
+            return e
+
+        before = {key(e): as_result(e) for e in self._entry_before.get("entries", [])}
+        after = {key(e): as_result(e) for e in self._entry_after.get("entries", [])}
+        all_keys = sorted(set(before) | set(after))
+
+        for k in all_keys:
+            device, subkey, point = k
+            b = before.get(k)
+            a = after.get(k)
+            bv = self._format_value(b)
+            av = self._format_value(a)
+            delta = self._delta(b, a)
+            changed = self._changed(b, a)
+            change_str = "⬤" if changed else ""
+            tags = []
+            if b and not a:
+                tags.append("only_before")
+                change_str = "removed"
+            elif a and not b:
+                tags.append("only_after")
+                change_str = "new"
+            elif changed:
+                tags.append("changed")
+            if changed_only and not changed and b and a:
+                continue
+            self._tree.insert(
+                "", "end",
+                values=(device, subkey, point, bv, av, delta, change_str),
+                tags=tuple(tags),
+            )
 
     def _render_device(self, changed_only: bool) -> None:
         before = {r.get("point_name"): r for r in self._entry_before["results"]}
@@ -2333,10 +2441,11 @@ class WalkPointsWindow(tk.Toplevel):
 
     COLUMNS = (
         ("device", "Device", 180, "w"),
-        ("point",  "Point", 220, "w"),
+        ("subkey", "Subkey", 85,  "w"),
+        ("point",  "Point", 200, "w"),
         ("value",  "Value", 110, "e"),
         ("units",  "Units", 70,  "center"),
-        ("desc",   "Description / Title", 280, "w"),
+        ("desc",   "Description / Title", 260, "w"),
     )
 
     def __init__(
@@ -2475,6 +2584,8 @@ class WalkPointsWindow(tk.Toplevel):
             k = self._sort_key
             if k == "device":
                 return (e.get("device", ""),)
+            if k == "subkey":
+                return (e.get("subkey", "") or "",)
             if k == "point":
                 return (e.get("point", ""),)
             if k == "value":
@@ -2501,6 +2612,7 @@ class WalkPointsWindow(tk.Toplevel):
                 continue
 
             device = e.get("device", "") or ""
+            subkey = e.get("subkey", "") or ""
             point = e.get("point", "") or ""
             raw = e.get("value")
             units = e.get("units", "") or ""
@@ -2517,7 +2629,7 @@ class WalkPointsWindow(tk.Toplevel):
 
             if filter_text:
                 haystack = " ".join(
-                    str(x).lower() for x in (device, point, value_str, units, desc)
+                    str(x).lower() for x in (device, subkey, point, value_str, units, desc)
                 )
                 if filter_text not in haystack:
                     continue
@@ -2525,7 +2637,7 @@ class WalkPointsWindow(tk.Toplevel):
             tags = ("title",) if title else ()
             self._tree.insert(
                 "", "end",
-                values=(device, point, value_str, units, desc),
+                values=(device, subkey, point, value_str, units, desc),
                 tags=tags,
             )
 

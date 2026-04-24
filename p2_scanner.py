@@ -12,7 +12,7 @@ Quick Start:
     python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
-
+Wire format reverse-engineered from PCAP captures and WCIS_Device.dll decompilation.
 """
 
 import socket
@@ -38,6 +38,10 @@ SCANNER_NAME = "P2SCAN|5034"     # Generic default; sites may require <SITE>DCC-
 DEBUG_READS = False              # When True, print raw hex on parse failures
 CONNECT_TIMEOUT = 5              # TCP connect timeout (seconds)
 READ_TIMEOUT = 10                # Read response timeout (seconds)
+HANDSHAKE_PROBE_TIMEOUT = 2.0    # First-dialect probe timeout — see _handshake(). A PXC speaking the legacy dialect
+                                 # responds well under a second; a PXC speaking the modern dialect stays silent.
+                                 # Setting this too long makes modern-dialect panels slow to connect; too short and
+                                 # a congested network falsely fails the first attempt.
 
 # Known nodes (optional — populated by discovery or site config file)
 # Format: {"NODE_NAME": "IP_ADDRESS", ...}
@@ -117,7 +121,7 @@ def load_config(filepath: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEC APPLICATION POINT DATABASES
+# TEC APPLICATION POINT DATABASES (Siemens Doc 125-5075)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Each TEC has up to 99 subpoints. The point names are fixed per application.
 # Address 0 is reserved, 1-99 are subpoints.
@@ -237,7 +241,7 @@ SUPPLY_TEMP_POINT = {
 def get_point_table(application: int) -> Dict[int, tuple]:
     """Build the complete point table for a given TEC application number.
 
-    First tries to load from tecpoints.json (rich format,
+    First tries to load from tecpoints.json (rich format from Tecpnts.dbf,
     797 apps with PTYPE / slope / intercept / state labels).
     Falls back to legacy tecpnts.json (name/units/dtype tuples).
     Falls back to hardcoded tables for apps 2020-2027 if neither available.
@@ -410,7 +414,7 @@ _TECPNTS_DB = None
 def _load_tecpnts_db() -> Optional[Dict]:
     """Load the TEC point database.
 
-    Prefers tecpoints.json (rich format, built with state
+    Prefers tecpoints.json (rich format, built from Tecpnts.dbf with state
     labels, slope/intercept, etc.). Falls back to legacy tecpnts.json.
     """
     import os
@@ -530,6 +534,11 @@ class P2Connection:
         self.sequence = 1
         self.node_name = None      # Learned from responses
         self._recv_buffer = b""
+        # Dialect detection — see _handshake() for why this matters.
+        # Initialized to TYPE_DATA (legacy PME1252 and earlier). If the target
+        # turns out to speak the PME1300 dialect, _handshake() flips this to
+        # TYPE_HEARTBEAT and every subsequent message uses the new type.
+        self.op_msg_type = P2Message.TYPE_DATA
 
     def connect(self, node_name: str = "node") -> bool:
         """Establish TCP connection and P2 session with the PXC controller."""
@@ -552,21 +561,34 @@ class P2Connection:
         return True
 
     def _handshake(self, node_name: str) -> bool:
-        """Establish a P2 session via the 0x33 DATA + 0x4640 identity-block path.
+        """Establish a P2 session, auto-detecting the PXC's message-type dialect.
 
-        Naming note: older comments called this a "keepalive" or "heartbeat." That's
-        a misnomer — the message type is TYPE_DATA (0x33), not TYPE_HEARTBEAT (0x34).
-        Real Desigo CC can use either path (explicit 0x2E CONNECT, or this 0x33-with-
-        identity-block form). Both work against PXC firmware; we use this one because
-        it's a single round-trip.
+        Two dialects are in use across Siemens PXC firmware:
+          - **Legacy (PME1252 and earlier)**: operational traffic uses TYPE_DATA (0x33).
+            The handshake exchange itself is 0x33-in, 0x33-out.
+          - **Modern (PME1300 / AAS platform)**: operational traffic uses
+            TYPE_HEARTBEAT (0x34). The handshake is 0x34-in, 0x34-out, and the
+            panel typically initiates with a 0x2F ANNOUNCE to the supervisor.
+
+        A PXC speaking the modern dialect will silently drop our 0x33 handshake
+        (not RST, not respond — just ignore). So the detection logic is: try 0x33
+        first with a short timeout; if nothing comes back, retry as 0x34. Whichever
+        wins is locked in on self.op_msg_type for every subsequent message this
+        connection sends.
+
+        Result is cached in _DIALECT_CACHE keyed by host IP, so repeated connects
+        to the same PXC within one process skip the probe.
+
+        Important: we must rebuild and re-send the identity block with a fresh seq
+        on retry. The PXC ties its response to the seq of the request that reached
+        it, so reusing the original seq after a timeout is fine for our own tracking
+        but pointless — the first seq's response will never come.
         """
-        seq = self._next_seq()
         net = self.network.encode('ascii')
         src = node_name.encode('ascii')
         scanner = self.scanner_name.encode('ascii')
         site = P2_SITE.encode('ascii')
 
-        # Build heartbeat: routing + 0x4640 identity block
         routing = (
             b'\x00' +
             net + b'\x00' +
@@ -574,25 +596,85 @@ class P2Connection:
             net + b'\x00' +
             scanner + b'\x00'
         )
-        identity = (
-            b'\x46\x40' +
-            b'\x01\x00' + bytes([len(scanner)]) + scanner +
-            b'\x01\x00' + bytes([len(site)]) + site +
-            b'\x01\x00' + bytes([len(net)]) + net +
-            b'\x00\x01\x01' +
-            b'\x00\x00\x00\x00\x00' +
-            struct.pack('>I', int(time.time())) + b'\x00' +
-            b'\xfe\x98\x00'
-        )
-        payload = routing + identity
-        msg = P2Message(P2Message.TYPE_DATA, seq, payload)
 
+        def build_identity():
+            # Fresh timestamp on every attempt. PXCs may reject handshakes with
+            # suspiciously old timestamps from the same scanner — rebuilding it
+            # per attempt keeps the retry clean.
+            return (
+                b'\x46\x40' +
+                b'\x01\x00' + bytes([len(scanner)]) + scanner +
+                b'\x01\x00' + bytes([len(site)]) + site +
+                b'\x01\x00' + bytes([len(net)]) + net +
+                b'\x00\x01\x01' +
+                b'\x00\x00\x00\x00\x00' +
+                struct.pack('>I', int(time.time())) + b'\x00' +
+                b'\xfe\x98\x00'
+            )
+
+        # Cache lookup — skip probing if we've talked to this panel before.
+        cached_dialect = _DIALECT_CACHE.get(self.host)
+        if cached_dialect is not None:
+            seq = self._next_seq()
+            mt = P2Message.TYPE_DATA if cached_dialect == 0x33 else P2Message.TYPE_HEARTBEAT
+            msg = P2Message(mt, seq, routing + build_identity())
+            if not self._send_message(msg):
+                return False
+            resp = self._recv_response(seq, max_attempts=5)
+            if resp is not None:
+                self.op_msg_type = mt
+                return True
+            # Cached value didn't work — maybe firmware upgraded or cache stale.
+            # Fall through to full probe, but evict the bad cache entry first.
+            _DIALECT_CACHE.pop(self.host, None)
+            self._recv_buffer = b""
+
+        # Attempt 1: legacy TYPE_DATA (0x33) dialect.
+        seq = self._next_seq()
+        msg = P2Message(P2Message.TYPE_DATA, seq, routing + build_identity())
         if not self._send_message(msg):
             return False
 
-        # Wait for heartbeat response
+        # Short first timeout — if the target speaks the legacy dialect, it
+        # responds in well under a second. Waiting the full READ_TIMEOUT here
+        # would make every modern-dialect PXC painfully slow to detect.
+        original_timeout = self.sock.gettimeout() if self.sock else READ_TIMEOUT
+        try:
+            if self.sock:
+                self.sock.settimeout(HANDSHAKE_PROBE_TIMEOUT)
+            resp = self._recv_response(seq, max_attempts=3)
+        finally:
+            if self.sock:
+                try: self.sock.settimeout(original_timeout)
+                except: pass
+
+        if resp is not None:
+            # Confirm the response msg_type — this is what the panel wants us
+            # to speak. The common case (PME1252) will be TYPE_DATA; odd panels
+            # that respond with TYPE_HEARTBEAT to a TYPE_DATA probe are rare
+            # but handled correctly here.
+            self.op_msg_type = resp.msg_type if resp.msg_type in (
+                P2Message.TYPE_DATA, P2Message.TYPE_HEARTBEAT
+            ) else P2Message.TYPE_DATA
+            _DIALECT_CACHE[self.host] = 0x33 if self.op_msg_type == P2Message.TYPE_DATA else 0x34
+            return True
+
+        # Attempt 2: modern TYPE_HEARTBEAT (0x34) dialect.
+        # Before retrying we need to drain any stale bytes in our recv buffer —
+        # a late response from attempt 1 would otherwise confuse the next read.
+        self._recv_buffer = b""
+        seq = self._next_seq()
+        msg = P2Message(P2Message.TYPE_HEARTBEAT, seq, routing + build_identity())
+        if not self._send_message(msg):
+            return False
+
         resp = self._recv_response(seq, max_attempts=5)
-        return resp is not None
+        if resp is not None:
+            self.op_msg_type = P2Message.TYPE_HEARTBEAT
+            _DIALECT_CACHE[self.host] = 0x34
+            return True
+
+        return False
 
     def close(self):
         """Close the TCP connection."""
@@ -703,7 +785,7 @@ class P2Connection:
             b'\x00\xff'
         )
 
-        msg = P2Message(P2Message.TYPE_DATA, seq, read_payload)
+        msg = P2Message(self.op_msg_type, seq, read_payload)
         if not self._send_message(msg):
             return None
 
@@ -939,7 +1021,7 @@ class P2Connection:
         seq = self._next_seq()
         routing = self._build_routing(node_name)
         body = struct.pack('>H', P2Message.OP_SYSINFO_COMPACT)
-        msg = P2Message(P2Message.TYPE_DATA, seq, routing + body)
+        msg = P2Message(self.op_msg_type, seq, routing + body)
         if not self._send_message(msg):
             return None
         resp = self._recv_response(seq)
@@ -980,27 +1062,24 @@ class P2Connection:
                                           or empty (len=0) on the first call
             01 00 00                empty TLV trailer
 
-        Response structure (after routing header):
-            00 00                   2-byte header
-            01 00 LL <dev>          TLV: device name
-            01 00 00 04 00 02 00 00 metadata block
-            01 00 LL <dev>          TLV: device name (repeated)
-            01 00 00 00 01          metadata
-            01 00 LL <dev>          TLV: device name (repeated again)
-            01 00 00                separator
-            01 00 LL <point>        TLV: POINT name  <-- what we want
-            3f ff ff f7             quality sentinel
-            00 00 06                padding
-            <f32>                   value (float)
-            23 00 00                padding
-            01 00 LL <units>        TLV: units string
-            trailer...
+        Cursor advancement strategy:
+            Normally the panel returns the next point alphabetically after the
+            cursor. When the cursor matches a point name that has a compound
+            identity (device + subkey, e.g. "BCCW" + "DAY.NGT"), the panel
+            sometimes returns the same record again because its internal index
+            uses the compound key and our single-name cursor doesn't advance
+            past it. Detection: if we get the same device name back, try
+            incrementing the last byte of the cursor (e.g. "BCCW" → "BCCX"),
+            which forces the panel to skip past the stuck entry and return
+            whatever comes next alphabetically. Give up after several such
+            retries to avoid infinite loops on genuinely-empty panels.
         """
         results = []
         cursor = b''   # empty on first call
-        seen_cursors = set()
+        seen_devices = set()
 
-        for _ in range(max_points):
+        def send_and_parse(cur: bytes):
+            """Send one enumerate request and return (parsed_dict or None)."""
             seq = self._next_seq()
             routing = self._build_routing(node_name)
             body = (struct.pack('>H', P2Message.OP_ENUM_POINTS) +
@@ -1008,34 +1087,95 @@ class P2Connection:
                     b'\x01\x00\x01\x2a' +   # first filter = "*"
                     b'\x01\x00\x01\x2a' +   # second filter = "*"
                     b'\x00\x00' +
-                    b'\x01' + struct.pack('>H', len(cursor)) + cursor +
+                    b'\x01' + struct.pack('>H', len(cur)) + cur +
                     b'\x01\x00\x00')
-            msg = P2Message(P2Message.TYPE_DATA, seq, routing + body)
+            msg = P2Message(self.op_msg_type, seq, routing + body)
             if not self._send_message(msg):
-                break
+                return None
             resp = self._recv_response(seq)
             if resp is None:
-                break
+                return None
             if resp.payload and resp.payload[0] == P2Message.DIR_ERROR:
-                break
+                return None
+            return self._parse_enum_points_response(resp.payload)
 
-            # Parse response payload manually — the _extract_lp_strings helper
-            # over-returns because the device name is repeated 3x in the response.
-            parsed = self._parse_enum_points_response(resp.payload)
+        def build_advance_cursors(cur: bytes):
+            """Yield successively more aggressive cursor mutations to force
+            advance past a stuck entry.
+
+            Strategy order (minimal advance first to preserve adjacent points):
+              1. Append 0x01 — `cur + \\x01` is the smallest string > cur.
+                 Example: "DIVV1" → "DIVV1\\x01"
+                 Returns the next entry after "DIVV1", which could be
+                 "DIVV10.STPT", "DIVV1T", or any longer prefix match.
+              2. Append ' ' (0x20) — space, first printable byte.
+              3. Append '0' (0x30) — matches numeric-suffix points.
+              4. Append 'A' (0x41) — matches alpha-suffix points.
+              5. Append 'a' (0x61) — matches lowercase-suffix points.
+              6. Append '~' (0x7E) — jumps past all printable-suffix entries
+                 that start with cur.
+              7. Byte-increment last character — "DIVV1" → "DIVV2".
+                 This is a big jump that skips everything with prefix "DIVV1".
+                 Only used as a last resort when all appends stall.
+              8. Increment + append space — last-ditch attempt.
+
+            Each mutation is strictly > cur in memcmp-with-length-tiebreak order.
+            """
+            if not cur:
+                yield b'\x01'
+                return
+            # Append mutations from smallest to largest suffix
+            for suffix in (b'\x01', b' ', b'0', b'A', b'a', b'~'):
+                yield cur + suffix
+            # Byte-increment the last character
+            last = cur[-1]
+            if last < 0x7E:
+                yield cur[:-1] + bytes([last + 1])
+                # And increment + space suffix
+                yield cur[:-1] + bytes([last + 1]) + b' '
+            else:
+                yield cur + b'\x01' + b'\x01'
+
+        for _ in range(max_points):
+            parsed = send_and_parse(cursor)
             if parsed is None:
                 break
+
             dev_name = parsed['device']
-            # Dedup by device name alone — the cursor only cares about device.
-            # A panel where point != device (e.g. ACVV / VAV INLET) emits ONE entry
-            # per cursor advance; a panel where point == device (Title-style) also
-            # emits ONE entry. Either way the device name advances monotonically.
-            if dev_name in seen_cursors:
-                break   # cursor failed to advance — PXC exhausted list
-            seen_cursors.add(dev_name)
+
+            if dev_name in seen_devices:
+                # Cursor stalled — panel returned a record we've already seen.
+                # This commonly happens on compound-identity points (e.g. BCCW
+                # with subkey DAY.NGT) where our single-name cursor can't
+                # advance past the compound record.
+                #
+                # Try a sequence of cursor mutations starting with the minimal
+                # advance (append \x01, which gives the smallest string > cur)
+                # so we don't accidentally skip over adjacent entries with the
+                # same prefix. Fall back to byte-increment only as last resort.
+                advanced = False
+                for candidate in build_advance_cursors(cursor):
+                    cursor = candidate
+                    retry = send_and_parse(cursor)
+                    if retry is None:
+                        break
+                    if retry['device'] not in seen_devices:
+                        # Escaped the stall — accept this record
+                        parsed = retry
+                        dev_name = parsed['device']
+                        advanced = True
+                        break
+                if not advanced:
+                    # Either the panel genuinely has no more points or we
+                    # couldn't find a cursor mutation that gets past the stuck
+                    # entry. Either way, terminate.
+                    break
+
+            seen_devices.add(dev_name)
             results.append(parsed)
 
             # Advance cursor with the DEVICE name from this response
-            cursor = dev_name.encode('ascii')
+            cursor = dev_name.encode('ascii', errors='replace')
 
         return results
 
@@ -1045,34 +1185,48 @@ class P2Connection:
     def _parse_enum_points_response(payload: bytes) -> Optional[Dict[str, Any]]:
         """Extract {device, point, value, units} from a 0x0981 response payload.
 
-        Two response shapes observed:
+        Three response shapes observed. The shape the panel picks depends on
+        (a) firmware dialect (PME1252 vs PME1300) and (b) point type (physical
+        sensor with a quality register vs PPCL-computed variable vs Title-only
+        panel entry).
 
-        SHAPE A — regular point (e.g. ACVV / VAV INLET):
+        SHAPE A — physical point with quality sentinel (e.g. AC04VV / VAV INLET):
             [routing header]
             00 00
-            01 00 LL <dev>              device name
-            01 00 00 <meta>
-            01 00 LL <dev>              device (repeated 3x)
-            01 00 LL <dev>
-            01 00 00
-            01 00 LL <point>            POINT name (distinct from dev)
-            3F FF FF Fx ... <f32>       quality sentinel + value
+            01 00 LL <dev>              device name (often repeated 3x)
+            01 00 LL <point>            point name
+            01 00 LL <description>      description
+            3F FF FF Fx 00 00 04        quality sentinel + marker
+            <f32 value>
             01 00 LL <units>            units
 
-        SHAPE B — "Title"-style panel-level point (e.g. "AC24 Serves 24th Floor.Title"):
+        SHAPE B — PPCL-computed variable with value, no quality register
+                  (e.g. BLR.MIN.STPT / "BLR HW STPT MIN" / 100.00 DEG F on NODE11):
             [routing header]
             00 00
-            01 00 LL <fullname>         full point name (3x repeated)
-            01 00 LL <fullname>
-            01 00 LL <fullname>
-            01 00 00
-            01 00 LL <description>      human description (e.g. "Serves 24th flr")
-            <metadata — NO quality sentinel, NO f32 value>
+            01 00 LL <name>             point name (repeated 3x)
+            01 00 LL <description>      description
+            00 00 00 00 00 00 02        7-byte zero-ish metadata (last byte = data-type code)
+            <f32 value>
+            00 00 00                    3-byte pad
+            01 00 LL <units>            units
 
-        Returns {'device', 'point', 'value', 'units'}. For SHAPE B, device == point
-        (the full name like "AC24 Serves 24th Floor.Title"), value=None, units holds
-        the description. The key invariant: device is always extractable and
-        suitable for use as the next cursor, which is what the walker needs.
+        SHAPE C — "Title"-only panel entry (e.g. "AC04 Serves 4th Floor.Title"):
+            [routing header]
+            00 00
+            01 00 LL <fullname>         full point name (repeated)
+            01 00 LL <description>      human description
+            <metadata — NO quality sentinel, NO float, NO units TLV>
+
+        The disambiguator: scan forward from after the description TLV looking for
+        a units TLV. If found, there's a value between description and units —
+        extract it as f32 from the 4 bytes immediately before the units TLV header.
+        The presence of a `3F FF FF F?` sentinel is a useful hint for SHAPE A but
+        isn't required; SHAPE B points have real values with no sentinel.
+
+        Returns {'device', 'point', 'value', 'units', 'description'}. For SHAPE C,
+        device == point, value is None, units is empty, description carries the
+        label.
         """
         # Skip routing header (4 null-terminated strings)
         i = 1
@@ -1097,7 +1251,7 @@ class P2Connection:
                     continue
             p += 1
 
-        # First non-empty TLV is the device/primary name
+        # First non-empty printable ASCII TLV is the device/primary name
         dev = None
         dev_positions = []
         for pos, L, val in tlvs:
@@ -1116,68 +1270,237 @@ class P2Connection:
         if dev is None:
             return None
 
-        # Next non-empty TLV after the last device repetition is either
-        # a point name (SHAPE A) or a description (SHAPE B).
-        # Heuristic: look for a quality sentinel 3F FF FF Fx in the body.
-        # If present, SHAPE A — extract point + value. If not, SHAPE B.
+        # Compound-name detection. Some panels return entries with TWO ASCII
+        # name TLVs in a row at the top of the body (instead of one name + an
+        # empty-TLV separator). Example from NODE3:
+        #     01 00 04 BCCW  01 00 07 DAY.NGT  02 00 02 00 00 ...
+        # vs normal:
+        #     01 00 07 BAY.OCC  01 00 00  02 00 02 00 00 ...
+        # The second name is a sub-key (some kind of subfield — schedule slot,
+        # point group, etc.). It's NOT units and NOT description — treating it
+        # as units (as earlier parser versions did) mangles display and can
+        # misalign value extraction. Detect it and set it aside so the rest of
+        # the parser ignores it.
+        #
+        # Detection: if the FIRST ASCII TLV after the first device occurrence
+        # (still within the "header" region, before the metadata bytes) is a
+        # non-empty ASCII TLV different from dev, we have a compound name.
+        subkey = ''
+        subkey_positions = set()
+        if dev_positions:
+            first_dev_end = dev_positions[0] + 3 + len(dev)
+            # Look at the very next TLV
+            for pos, L, val in tlvs:
+                if pos < first_dev_end:
+                    continue
+                # The first TLV we see after the dev must be either empty
+                # (normal case) or a non-empty ASCII TLV (compound case).
+                if L == 0:
+                    break  # normal — no subkey
+                try:
+                    s = val.decode('ascii')
+                except UnicodeDecodeError:
+                    break
+                if not s.isprintable() or s == dev:
+                    break
+                # Found a compound subkey
+                subkey = s
+                # Find all positions where this subkey appears — we'll
+                # exclude them from units/description candidates
+                for p2, L2, val2 in tlvs:
+                    if L2 == 0:
+                        continue
+                    try:
+                        s2 = val2.decode('ascii')
+                    except UnicodeDecodeError:
+                        continue
+                    if s2 == subkey:
+                        subkey_positions.add(p2)
+                break
+
+        # Next ASCII TLV after the last device repetition is either:
+        #   - a point name (SHAPE A with separate dev/point, rare)
+        #   - a description (SHAPE B or C — dev == point, description is distinct)
+        # We'll collect all ASCII TLVs past the last device repetition so we can
+        # distinguish SHAPE A (where there's typically a point name BEFORE the
+        # description, differing from dev) from SHAPE B/C.
+        after_last_dev = (dev_positions[-1] + 3 + len(dev)) if dev_positions else 0
+        subsequent = []
+        for pos, L, val in tlvs:
+            if pos <= after_last_dev or L == 0:
+                continue
+            if pos in subkey_positions:
+                # Don't let a compound-name subkey be mistaken for units or desc
+                continue
+            try:
+                s = val.decode('ascii')
+            except UnicodeDecodeError:
+                continue
+            if s.isprintable() and s != subkey:
+                subsequent.append((pos, L, s))
+
+        if not subsequent:
+            # No description or units found — return dev-only
+            return {'device': dev, 'point': dev, 'value': None,
+                    'units': '', 'description': '', 'subkey': subkey}
+
+        # Quality sentinel hint for SHAPE A
         q_idx = -1
         for p in range(len(body) - 4):
             if body[p] == 0x3F and body[p+1] == 0xFF and body[p+2] == 0xFF:
                 q_idx = p
                 break
 
-        secondary = None       # for SHAPE A: point name. for SHAPE B: description.
-        secondary_pos = None
-        after_last_dev = (dev_positions[-1] + 3 + len(dev)) if dev_positions else 0
-        for pos, L, val in tlvs:
-            if pos <= after_last_dev or L == 0:
-                continue
-            try:
-                s = val.decode('ascii')
-            except UnicodeDecodeError:
-                continue
-            if not s.isprintable():
-                continue
+        # Find a units TLV. Real engineering units are narrow: short, no internal
+        # multi-word spaces (except known patterns like "DEG F", "IN H20"). Multi-
+        # word strings like "BLR 2 ALM" are descriptions, not units, even when short.
+        #
+        # Heuristic: a units string is <= 8 chars and either has no spaces OR
+        # starts with "DEG " / "IN " (the only two space-containing unit patterns
+        # we've seen). Also accept single-char units like "%".
+        def looks_like_units(s: str) -> bool:
+            s = s.strip()
+            if not s: return False
+            if len(s) > 8: return False
+            # Single char / no-space units: "%", "MA", "PSI", "CFM", "PPM", etc.
+            if ' ' not in s: return True
+            # Space-containing patterns we accept as units
+            if s.startswith('DEG ') or s.startswith('deg '): return True
+            if s.startswith('IN '): return True
+            return False
+
+        units_candidates = []
+        for (pos, L, s) in subsequent:
             if s == dev:
                 continue
-            # If there's a quality sentinel, the secondary must come BEFORE it (point name).
-            # If no sentinel, the first string after the dev repetitions is the description.
-            if q_idx >= 0 and pos > q_idx:
-                break
-            secondary = s
-            secondary_pos = pos
+            if L <= 10 and L > 0 and looks_like_units(s):
+                units_candidates.append((pos, L, s.strip()))
+
+        # The units TLV, if present, is typically the LAST ASCII TLV in the body
+        # (before trailing binary metadata). Pick the last candidate.
+        units_pos = None
+        units_str = ''
+        if units_candidates:
+            units_pos, units_L, units_str = units_candidates[-1]
+
+        # Description: first ASCII TLV after the last device repetition that isn't units
+        description = ''
+        point_name = dev
+        for (pos, L, s) in subsequent:
+            if s == dev:
+                continue
+            if units_pos is not None and pos == units_pos:
+                continue
+            # In SHAPE A, there's sometimes a distinct point name before the description.
+            # Detect this: if we see a non-dev ASCII TLV that's followed by another
+            # ASCII TLV (the description) before the quality sentinel or units, then
+            # this first one is the point name.
+            description = s
             break
 
+        # Try to extract a float value. Three sources in order of reliability:
+        #   1. If quality sentinel present (SHAPE A), offset +7/+4/+8 past it.
+        #      Physical points with a quality register use this.
+        #   2. SHAPE B marker: `00 00 00 00 00 00 XX` (6 zeros + data-type byte)
+        #      immediately after the description TLV, followed by an f32.
+        #      Covers all PME1300 computed/binary points — with or without units.
+        #   3. Fall back to offset-relative-to-units-TLV for edge cases.
+        #   4. Otherwise no value.
+        value = None
+
         if q_idx >= 0:
-            # SHAPE A — read value from past the sentinel
-            value = None
+            # SHAPE A: value lives past the quality sentinel
             for offset in (7, 4, 8):
                 if q_idx + offset + 4 <= len(body):
                     try:
                         candidate = struct.unpack('>f', body[q_idx+offset:q_idx+offset+4])[0]
-                        if -1e10 < candidate < 1e10 and candidate == candidate:
+                        if candidate == candidate and -1e10 < candidate < 1e10:
                             value = candidate
                             break
                     except struct.error:
                         continue
-            # Units = first ASCII TLV after the point (past quality sentinel)
-            units = ''
-            for pos, L, val in tlvs:
-                if L == 0 or pos <= q_idx:
-                    continue
-                try:
-                    s = val.decode('ascii')
-                except UnicodeDecodeError:
-                    continue
-                if s.isprintable() and s != dev and s != secondary:
-                    units = s.strip()
-                    break
-            return {'device': dev, 'point': secondary or dev,
-                    'value': value, 'units': units, 'description': ''}
+
+        if value is None:
+            # SHAPE B marker scan — 6 zero bytes followed by a small data-type
+            # code (observed: 01, 02, 03, 04, 05, 06), then the f32 in the next
+            # 4 bytes.
+            #
+            # The SHAPE B layout is:
+            #     [description TLV] [7-byte meta] [f32] [3-byte pad] [units TLV]
+            # So the value sits BETWEEN the description TLV and the units TLV.
+            # Scan in that window, not after the last ASCII TLV (which would
+            # typically be units, already past the value).
+            #
+            # Start scan: immediately after the FIRST non-dev ASCII TLV
+            # (which is the description). Stop scan: before the units TLV
+            # if present, else to end of body.
+            scan_start = 0
+            scan_end = len(body) - 11
+            if subsequent:
+                first_pos, first_L, _ = subsequent[0]
+                scan_start = first_pos + 3 + first_L
+                if units_pos is not None and units_pos > scan_start:
+                    scan_end = units_pos
+            for p in range(scan_start, min(scan_end, len(body) - 11)):
+                if (body[p] == 0 and body[p+1] == 0 and body[p+2] == 0 and
+                    body[p+3] == 0 and body[p+4] == 0 and body[p+5] == 0 and
+                    body[p+6] in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06)):
+                    try:
+                        candidate = struct.unpack('>f', body[p+7:p+11])[0]
+                        if candidate == candidate and -1e10 < candidate < 1e10:
+                            value = candidate
+                            break
+                    except struct.error:
+                        continue
+
+        if value is None and units_pos is not None and units_pos >= 4:
+            # SHAPE B extraction: f32 sits before the units TLV header.
+            # Layout: [7-byte meta][f32][3-byte pad][01 00 LL units]
+            # So the float is at units_pos - 3 - 4 = units_pos - 7.
+            # SHAPE A may also have a units TLV but the bytes before are
+            # structural (00 00 04 [f32]); that float is 4 before units_pos
+            # in the A layout. Try -7 first (B), then -4 (A), then -8.
+            for back in (7, 4, 8):
+                if units_pos - back >= 0:
+                    try:
+                        candidate = struct.unpack('>f', body[units_pos-back:units_pos-back+4])[0]
+                        if candidate == candidate and -1e10 < candidate < 1e10:
+                            # Sanity check: reject tiny non-zero "noise" values that
+                            # come from misaligned reads of zero bytes. Values in the
+                            # range of sub-picovolt (|x| < 1e-6) with nonzero bits are
+                            # almost certainly misaligned interpretations.
+                            if abs(candidate) < 1e-6 and candidate != 0.0:
+                                continue
+                            value = candidate
+                            break
+                    except struct.error:
+                        continue
+
+        if value is None and q_idx >= 0:
+            # SHAPE A fallback: value lives past the quality sentinel
+            for offset in (7, 4, 8):
+                if q_idx + offset + 4 <= len(body):
+                    try:
+                        candidate = struct.unpack('>f', body[q_idx+offset:q_idx+offset+4])[0]
+                        if candidate == candidate and -1e10 < candidate < 1e10:
+                            value = candidate
+                            break
+                    except struct.error:
+                        continue
+
+        # Final classification:
+        # - If we found a value OR a units TLV OR a sentinel → valued point (A or B)
+        # - Otherwise → SHAPE C (Title-only, device==point, description only)
+        if value is not None or units_pos is not None or q_idx >= 0:
+            return {'device': dev, 'point': point_name or dev,
+                    'value': value, 'units': units_str,
+                    'description': description if description != dev else '',
+                    'subkey': subkey}
         else:
-            # SHAPE B — no value, no units; secondary is description. device == point.
+            # SHAPE C — title-only, no value
             return {'device': dev, 'point': dev, 'value': None,
-                    'units': '', 'description': (secondary or '').strip()}
+                    'units': '', 'description': description.strip(),
+                    'subkey': subkey}
 
     def read_programs(self, node_name: str = "node",
                       max_requests: int = 5000) -> List[Dict[str, Any]]:
@@ -1229,7 +1552,7 @@ class P2Connection:
                     b'\x00\x00' +
                     b'\x01' + struct.pack('>H', len(current_name)) + current_name +
                     struct.pack('>H', current_line))              # u16 BE line number
-            msg = P2Message(P2Message.TYPE_DATA, seq, routing + body)
+            msg = P2Message(self.op_msg_type, seq, routing + body)
             if not self._send_message(msg):
                 break
             resp = self._recv_response(seq)
@@ -1357,7 +1680,7 @@ class P2Connection:
             b'\x00\x00\x01\x00\x00\xff\xff'
         )
 
-        msg = P2Message(P2Message.TYPE_DATA, seq, browse_payload)
+        msg = P2Message(self.op_msg_type, seq, browse_payload)
         if not self._send_message(msg):
             return None
 
@@ -2503,6 +2826,83 @@ def discover_node_name(host: str) -> Optional[str]:
     return result['node_name'] if result else None
 
 
+# Per-host dialect cache. Keyed by host IP string. Values are 0x33 or 0x34.
+# Saves a ~2-second probe on every subsequent connection to the same PXC within
+# a single process lifetime — notable for building-wide sweeps that hit each
+# panel multiple times (discover, then verify, then read_all).
+_DIALECT_CACHE: Dict[str, int] = {}
+
+
+def _probe_dialect(sock: socket.socket, handshake_msg_0x33: bytes,
+                   handshake_msg_0x34: bytes,
+                   host: Optional[str] = None) -> Optional[int]:
+    """Send a handshake probe and detect which message-type dialect the PXC speaks.
+
+    PXC firmware splits into two dialects:
+      - Legacy (PME1252 and earlier): operational traffic uses msg_type 0x33 DATA.
+        Handshake is 0x33-in, 0x33-out.
+      - Modern (PME1300 / AAS): operational traffic uses msg_type 0x34 HEARTBEAT.
+        Handshake is 0x34-in, 0x34-out.
+
+    A PXC silently drops handshakes sent with the wrong msg_type. The detection
+    strategy: try 0x33 first with a short timeout; if nothing comes back, retry
+    as 0x34. Returns the confirmed msg_type (0x33 or 0x34) on success, or None on
+    total failure.
+
+    Both handshake payloads should be pre-built by the caller with identical
+    routing + identity bodies but different msg_type bytes in the 12-byte header.
+
+    If `host` is provided, the detected dialect is cached for subsequent calls
+    against the same host. The cache is process-local — site.json doesn't
+    persist it, so a fresh process pays the probe cost once per panel.
+    """
+    # Check cache first. If we've seen this host before, skip the probe.
+    if host is not None and host in _DIALECT_CACHE:
+        cached = _DIALECT_CACHE[host]
+        msg = handshake_msg_0x33 if cached == 0x33 else handshake_msg_0x34
+        try:
+            sock.sendall(msg)
+            sock.settimeout(3.0)
+            data = sock.recv(4096)
+            if data:
+                return cached
+            # Cache hit produced no response — panel may have flipped dialect
+            # (firmware upgrade?) or the cache entry is stale. Fall through to
+            # full probe to rediscover.
+            del _DIALECT_CACHE[host]
+        except socket.error:
+            # Socket died mid-cache-check. Caller has to deal with this.
+            return None
+
+    try:
+        sock.sendall(handshake_msg_0x33)
+        sock.settimeout(HANDSHAKE_PROBE_TIMEOUT)
+        data = sock.recv(4096)
+        if data:
+            # Legacy dialect confirmed — use 0x33 for the rest of the session
+            if host is not None:
+                _DIALECT_CACHE[host] = 0x33
+            return 0x33
+    except socket.timeout:
+        pass
+    except socket.error:
+        return None
+
+    # No response on 0x33. Try 0x34.
+    try:
+        sock.sendall(handshake_msg_0x34)
+        sock.settimeout(3.0)
+        data = sock.recv(4096)
+        if data:
+            if host is not None:
+                _DIALECT_CACHE[host] = 0x34
+            return 0x34
+    except (socket.timeout, socket.error):
+        return None
+
+    return None
+
+
 def get_node_info(host: str, node_name: str) -> Optional[Dict]:
     """
     Query firmware version and panel info from a PXC node using opcode 0x0100.
@@ -2520,7 +2920,8 @@ def get_node_info(host: str, node_name: str) -> Optional[Dict]:
     site = (P2_SITE if P2_SITE else "SITE").encode('ascii')
     node_lower = node_name.lower().encode('ascii')
 
-    # Handshake
+    # Build the handshake payload once. We'll wrap it with two different msg_type
+    # bytes and try each in turn via _probe_dialect().
     routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
     identity = (
         b'\x46\x40\x01\x00' + bytes([len(scanner)]) + scanner +
@@ -2529,19 +2930,18 @@ def get_node_info(host: str, node_name: str) -> Optional[Dict]:
         b'\x00\x01\x01\x00\x00\x00\x00\x00' +
         struct.pack('>I', int(time.time())) + b'\x00\xfe\x98\x00'
     )
-    hb_msg = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, 1) + routing + identity
-    try:
-        s.sendall(hb_msg)
-        s.settimeout(3)
-        s.recv(4096)
-    except:
+    hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, 1) + routing + identity
+    hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, 1) + routing + identity
+
+    dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
+    if dialect is None:
         s.close()
         return None
 
     # Send opcode 0x0100 (GetRevString) — try with empty data
     info_routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
     info_data = struct.pack('>H', 0x0100)
-    msg = struct.pack('>III', 12 + len(info_routing) + len(info_data), 0x33, 10) + info_routing + info_data
+    msg = struct.pack('>III', 12 + len(info_routing) + len(info_data), dialect, 10) + info_routing + info_data
 
     try:
         s.sendall(msg)
@@ -2632,7 +3032,8 @@ def enumerate_fln_devices(host: str, node_name: str) -> List[Dict]:
     site = (P2_SITE if P2_SITE else "SITE").encode('ascii')
     node_lower = node_name.lower().encode('ascii')
 
-    # Handshake
+    # Build both dialect variants of the handshake and probe to see which the
+    # PXC wants. See _probe_dialect() for why this exists.
     routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
     identity = (
         b'\x46\x40\x01\x00' + bytes([len(scanner)]) + scanner +
@@ -2641,19 +3042,18 @@ def enumerate_fln_devices(host: str, node_name: str) -> List[Dict]:
         b'\x00\x01\x01\x00\x00\x00\x00\x00' +
         struct.pack('>I', int(time.time())) + b'\x00\xfe\x98\x00'
     )
-    hb_msg = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, 1) + routing + identity
-    try:
-        s.sendall(hb_msg)
-        s.settimeout(3)
-        s.recv(4096)
-    except:
+    hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, 1) + routing + identity
+    hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, 1) + routing + identity
+
+    dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
+    if dialect is None:
         s.close()
         print(f"    [ERROR] Handshake failed")
         return []
 
     cursor = "*"
     seq = 2000
-    
+
     for iteration in range(200):
         seq += 1
         cb = cursor.encode('ascii')
@@ -2661,7 +3061,7 @@ def enumerate_fln_devices(host: str, node_name: str) -> List[Dict]:
                      b'\x00\x00\x00' + struct.pack('>H', 1) + b'*' +
                      b'\x00\x00\x00' + struct.pack('>H', len(cb)) + cb)
         enum_routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
-        msg = struct.pack('>III', 12 + len(enum_routing) + len(enum_data), 0x33, seq) + enum_routing + enum_data
+        msg = struct.pack('>III', 12 + len(enum_routing) + len(enum_data), dialect, seq) + enum_routing + enum_data
         
         try:
             s.sendall(msg)
@@ -2874,7 +3274,7 @@ def discover_devices_on_node(host: str, node_name: str,
     site = (P2_SITE if P2_SITE else "SITE").encode('ascii')
     node_lower = node_name.lower().encode('ascii')
 
-    # Handshake
+    # Build both dialect variants for probe.
     routing_hb = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
     identity = (
         b'\x46\x40' +
@@ -2885,12 +3285,11 @@ def discover_devices_on_node(host: str, node_name: str,
         struct.pack('>I', int(time.time())) + b'\x00\xfe\x98\x00'
     )
     hb_payload = routing_hb + identity
-    hb_msg = struct.pack('>III', 12 + len(hb_payload), 0x33, 1) + hb_payload
-    try:
-        s.sendall(hb_msg)
-        s.settimeout(3)
-        s.recv(4096)
-    except:
+    hs_0x33 = struct.pack('>III', 12 + len(hb_payload), 0x33, 1) + hb_payload
+    hs_0x34 = struct.pack('>III', 12 + len(hb_payload), 0x34, 1) + hb_payload
+
+    dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
+    if dialect is None:
         s.close()
         print(f"    [ERROR] Handshake failed")
         return []
@@ -2923,7 +3322,7 @@ def discover_devices_on_node(host: str, node_name: str,
                 b'\x00\xff'
             )
             payload = routing + read_data
-            msg = struct.pack('>III', 12 + len(payload), 0x33, seq) + payload
+            msg = struct.pack('>III', 12 + len(payload), dialect, seq) + payload
             batch_msgs += msg
 
         try:
