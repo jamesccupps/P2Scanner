@@ -40,6 +40,7 @@ Single Python module, zero external dependencies, read-only by design.
 | `tecpoints.json` | Point definitions for 797 TEC applications |
 | `site.json` | Site-configuration template |
 | `PROTOCOL.md` | Wire-level protocol reference |
+| `p2.lua` | Wireshark dissector — decodes P2 frames in Wireshark's UI |
 
 ---
 
@@ -237,6 +238,26 @@ The library is synchronous. For a GUI, run reads on a worker thread (see `p2_gui
 - **Read-only.** The scanner never writes points, changes setpoints, or modifies controller state. Write-capable opcodes are documented in `PROTOCOL.md` but intentionally not exposed.
 - **PXCs have a limited number of peer sessions** (typically 8–16). Don't run parallel scanners against the same panel.
 - **Cold discovery sends dictionary probes.** Observed as non-disruptive, but use `--cold-delay 2` during production hours as a precaution.
+
+## Wireshark dissector
+
+A Lua dissector (`p2.lua`) is included for decoding P2 frames live in Wireshark — useful for protocol debugging, learning the wire format, or analyzing traffic from production sites.
+
+**Install:**
+
+```
+# Linux / macOS
+cp p2.lua ~/.local/lib/wireshark/plugins/
+
+# Windows
+copy p2.lua %APPDATA%\Wireshark\plugins\
+
+# Or find your plugin path via Wireshark: Help → About Wireshark → Folders → Personal Lua Plugins
+```
+
+Restart Wireshark. The dissector auto-attaches to TCP ports 5033 and 5034. Decoded fields appear under the **P2** tree in the packet details pane: opcode names, error codes, sequence numbers, message types, and direction byte.
+
+The dissector is conservative — it doesn't try to decode every TLV inside payloads, just the framing and opcodes. For deeper byte-level analysis use `analyze_pcap.py` against a saved capture.
 
 ---
 
