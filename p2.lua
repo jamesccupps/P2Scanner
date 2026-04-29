@@ -81,6 +81,7 @@ local OPCODES = {
     [0x0245] = "TestProbe (always errors; not a real op)",
     [0x0291] = "Read/write variant 02xx (rare)",
     [0x0294] = "Read variant 02xx (rare; small/large body forms)",
+    [0x0295] = "Read variant 02xx (SYST + obj [+ MODE]; rare)",
     [0x02A8] = "Write variant 02xx (rare)",
 
     -- Object lifecycle (02xx)
@@ -312,6 +313,13 @@ end
 
 -- Pull all `01 00 LL [ASCII]` style LP-strings from a TvbRange. Mirrors
 -- _extract_lp_strings in the scanner. Returns a list of {offset, length, value}.
+--
+-- Important: validate the raw bytes are printable ASCII directly — do NOT
+-- rely on `:string()` to filter, because Wireshark's TvbRange:string()
+-- truncates at the first NUL byte. A "\0\0" payload would otherwise round-
+-- trip as an empty string and pass a pattern-based check, polluting results
+-- with phantom empty entries (the alarm-header `01 00 02 00 00` padding TLV
+-- exhibits this).
 local function extract_lp_strings(tvb)
     local out = {}
     local len = tvb:len()
@@ -320,9 +328,17 @@ local function extract_lp_strings(tvb)
         if tvb(i, 1):uint() == 0x01 and tvb(i+1, 1):uint() == 0x00 then
             local slen = tvb(i+2, 1):uint()
             if slen > 0 and slen < 100 and (i + 3 + slen) <= len then
-                local s = tvb(i+3, slen):string()
-                if s:match("^[%w%p%s]*$") then
-                    table.insert(out, {offset = i, length = 3 + slen, value = s})
+                local ok = true
+                for j = i + 3, i + 2 + slen do
+                    local b = tvb(j, 1):uint()
+                    if b < 0x20 or b > 0x7E then ok = false; break end
+                end
+                if ok then
+                    table.insert(out, {
+                        offset = i,
+                        length = 3 + slen,
+                        value  = tvb(i+3, slen):string(),
+                    })
                     i = i + 3 + slen
                 else
                     i = i + 1
@@ -473,38 +489,32 @@ local function dissect_value_block(tvb, vb, parent, pinfo)
 end
 
 ------------------------------------------------------------------------
--- Routing header — msg-type-aware labels
--- PROTOCOL.md "Routing header" & "Name ordering" tables:
---   * DATA / HEARTBEAT (C2S): slot 2 = destination, slot 4 = source
---   * DATA / HEARTBEAT (S2C): slot 2 = destination (= orig src),
---                              slot 4 = source      (= orig dst)
---   * CONNECT / ANNOUNCE:     slot 2 = sender (self),
---                              slot 4 = recipient (peer)
+-- Routing header
+-- PROTOCOL.md "Routing header" claims slot 2/4 ordering depends on msg
+-- type — that CONNECT/ANNOUNCE put sender in slot 2, recipient in slot 4
+-- (opposite of DATA/HEARTBEAT). EMPIRICAL FINDING: real captures of
+-- panel-initiated CONNECT/ANNOUNCE (PXC reaching back to DCC's 5033 in
+-- Mode C) put **destination** in slot 2 and **source** in slot 4 — the
+-- DATA/HEARTBEAT convention — and the IdentifyBlock body's first TLV
+-- agrees with slot 4, not slot 2. So we label slot 2 as Destination and
+-- slot 4 as Source for ALL message types. The doc's table appears to be
+-- wrong, or applies only to a Mode A handshake from supervisor side that
+-- the test corpus didn't include.
 ------------------------------------------------------------------------
-
-local function routing_field_pair(msg_type)
-    if msg_type == 0x2E or msg_type == 0x2F then
-        return f.sender, f.recipient
-    end
-    return f.dst_node, f.src_node
-end
 
 -- Parses [dir][BLN\0][slot2\0][BLN\0][slot4\0]. Returns body offset.
 local function dissect_routing(tvb, tree, msg_type)
     local rtree = tree:add(p2, tvb, "Routing Header")
     rtree:add(f.dir_byte, tvb(0, 1))
-    local slot2_field, slot4_field = routing_field_pair(msg_type)
-    local fields = { f.bln1, slot2_field, f.bln2, slot4_field }
+    local fields = { f.bln1, f.dst_node, f.bln2, f.src_node }
     local off = 1
     for _, field in ipairs(fields) do
         local s, n = read_cstring(tvb, off)
         if not s then return nil end
         rtree:add(field, tvb(off, n - 1), s)
-        -- Also expose under the neutral node_a / node_b names so a filter
-        -- like `p2.node_a == "NODE6"` works regardless of msg type.
-        if field == slot2_field then
+        if field == f.dst_node then
             rtree:add(f.node_a, tvb(off, n - 1), s)
-        elseif field == slot4_field then
+        elseif field == f.src_node then
             rtree:add(f.node_b, tvb(off, n - 1), s)
         end
         off = off + n
@@ -750,11 +760,105 @@ local function dissect_name_pair(rest, tree, pinfo)
 end
 
 ------------------------------------------------------------------------
+-- Value-update opcodes (0x0274 ValuePush, 0x0240 WriteWithQuality).
+-- Empirically validated against this capture's 5033 / 5034 traffic:
+--
+-- 0x0274 PXC->DCC (5034): 02 74 [00 01 00 00] [LP device] [LP point] [f32 BE]
+-- 0x0274 DCC->PXC (5033): 02 74 [00 01 00 00] [LP point] [01 00 00] [f32 BE]
+-- 0x0240 PXC->DCC (5034): 02 40 [LP "NONE"] 00 [3FFFFFFF] 00 00 [LP point]
+--                         01 00 00 00 00 01 00 00 01 00 00 [f32 BE]
+--
+-- For 0x0274 we can place the float at the byte after the last LP-string.
+-- For 0x0240 we walk forward to find a `01 00 00` marker preceded by ASCII
+-- and read 4 bytes at marker+11 (slightly different layout from R1/R2/R3
+-- read responses).
+------------------------------------------------------------------------
+
+local function dissect_value_update(rest, tree, pinfo, opcode, src_port)
+    local strings = extract_lp_strings(rest)
+    if #strings == 0 then return end
+
+    if opcode == 0x0274 then
+        -- Branch on the wire shape rather than the port: PXC->DCC carries
+        -- two LP-strings (device + point); DCC->PXC carries one (point
+        -- only). This is more reliable than port-checking — Mode C flows
+        -- can put DCC->5033 PXC traffic on either side.
+        if #strings >= 2 then
+            tree:add(f.device_name,
+                rest(strings[1].offset + 3, strings[1].length - 3),
+                strings[1].value)
+            tree:add(f.point_name,
+                rest(strings[2].offset + 3, strings[2].length - 3),
+                strings[2].value)
+            local foff = strings[2].offset + strings[2].length
+            if foff + 4 <= rest:len() then
+                tree:add(f.float_value, rest(foff, 4))
+                pinfo.cols.info:append(string.format(" %s/%s = %g",
+                    strings[1].value, strings[2].value, rest(foff, 4):float()))
+            else
+                pinfo.cols.info:append(string.format(" %s/%s",
+                    strings[1].value, strings[2].value))
+            end
+        else
+            -- DCC->PXC push-write: just a point name; float sits 3 bytes
+            -- past the LP-string end (skipping the `01 00 00` empty TLV).
+            tree:add(f.point_name,
+                rest(strings[1].offset + 3, strings[1].length - 3),
+                strings[1].value)
+            local foff = strings[1].offset + strings[1].length + 3
+            if foff + 4 <= rest:len() then
+                tree:add(f.float_value, rest(foff, 4))
+                pinfo.cols.info:append(string.format(" (BLN-push) %s = %g",
+                    strings[1].value, rest(foff, 4):float()))
+            else
+                pinfo.cols.info:append(string.format(" (BLN-push) %s",
+                    strings[1].value))
+            end
+        end
+
+    elseif opcode == 0x0240 then
+        -- Device is literally "NONE" for panel-globals; point follows.
+        if #strings >= 2 then
+            tree:add(f.device_name,
+                rest(strings[1].offset + 3, strings[1].length - 3),
+                strings[1].value)
+            tree:add(f.point_name,
+                rest(strings[2].offset + 3, strings[2].length - 3),
+                strings[2].value)
+            -- Look for the value-block marker after the point name. Per
+            -- PROTOCOL.md "0x0240 WriteWithQuality wire format", the f32
+            -- sits 11 bytes past the FIRST `01 00 00` marker that follows
+            -- the point TLV — different from the R1/R2/R3 read-response
+            -- shape, so don't reuse find_value_block here.
+            local scan_from = strings[2].offset + strings[2].length
+            local found = nil
+            for j = scan_from, rest:len() - 14 do
+                if  rest(j, 1):uint()   == 0x01
+                and rest(j+1, 1):uint() == 0x00
+                and rest(j+2, 1):uint() == 0x00 then
+                    found = j
+                    break
+                end
+            end
+            if found and found + 15 <= rest:len() then
+                tree:add(f.float_value, rest(found + 11, 4))
+                pinfo.cols.info:append(string.format(" %s/%s = %g",
+                    strings[1].value, strings[2].value,
+                    rest(found + 11, 4):float()))
+            else
+                pinfo.cols.info:append(string.format(" %s/%s",
+                    strings[1].value, strings[2].value))
+            end
+        end
+    end
+end
+
+------------------------------------------------------------------------
 -- Body dispatcher: dispatches operational opcodes regardless of which
 -- msg type carries them (0x33, 0x34, or Mode C 0x2E/0x2F).
 ------------------------------------------------------------------------
 
-local function dispatch_request(opcode, rest, btree, pinfo)
+local function dispatch_request(opcode, rest, btree, pinfo, src_port)
     if opcode == 0x0271 or opcode == 0x0220 or opcode == 0x0272
             or opcode == 0x0273 or opcode == 0x0241 or opcode == 0x0244 then
         dissect_name_pair(rest, btree, pinfo)
@@ -774,10 +878,14 @@ local function dispatch_request(opcode, rest, btree, pinfo)
     elseif opcode == 0x4634 then
         dissect_routing_table(rest, btree, pinfo)
 
+    elseif opcode == 0x0274 or opcode == 0x0240 then
+        dissect_value_update(rest, btree, pinfo, opcode, src_port)
+
     elseif opcode == 0x4222 or opcode == 0x4221 or opcode == 0x4220
-            or opcode == 0x4200 or opcode == 0x0240 or opcode == 0x0274
-            or opcode == 0x02A8 or opcode == 0x0291 then
-        -- Reads & writes carrying a SYST/device/point structure plus value.
+            or opcode == 0x4200 or opcode == 0x02A8 or opcode == 0x0291
+            or opcode == 0x0294 or opcode == 0x0295 then
+        -- SYST/device/point read or write — surface strings; value
+        -- breakout differs across these and isn't fully byte-mapped yet.
         local strings = extract_lp_strings(rest)
         if #strings >= 1 then
             local raw = ""
@@ -837,6 +945,10 @@ local function dissect_one_frame(tvb, pinfo, root)
     local total_len = tvb(0, 4):uint()
     local msg_type  = tvb(4, 4):uint()
     local sequence  = tvb(8, 4):uint()
+
+    -- src_port lets value-update opcodes branch on the listening port
+    -- (0x0274 has direction-dependent wire format; see PROTOCOL.md).
+    local src_port = pinfo.src_port or 0
 
     local tree = root:add(p2, tvb(0, total_len), "Siemens P2")
 
@@ -909,7 +1021,7 @@ local function dissect_one_frame(tvb, pinfo, root)
         pinfo.cols.info:append(string.format(" %s [Request]", op_name))
 
         local rest = body(2, body:len() - 2)
-        dispatch_request(opcode, rest, btree, pinfo)
+        dispatch_request(opcode, rest, btree, pinfo, src_port)
 
     elseif dir_byte == 0x05 then
         -- Error response: u16 BE error code immediately after routing
