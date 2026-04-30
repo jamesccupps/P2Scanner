@@ -869,29 +869,70 @@ class P2Connection:
         # point-name tail, and the next 10 bytes are our value block.
 
         flags_idx = -1
-        for i in range(1, len(payload) - 14):
-            if (payload[i]   == 0x01 and payload[i+1] == 0x00
-                and payload[i+2] == 0x00
-                and payload[i+7] == 0x00 and payload[i+8] == 0x00):
-                prev = payload[i-1]
-                # Previous byte must be printable ASCII (end of point name string)
-                # Accepted chars: A-Z, a-z, 0-9, space, period, underscore, hyphen
-                is_asciiend = (
-                    (0x41 <= prev <= 0x5A) or   # A-Z
-                    (0x61 <= prev <= 0x7A) or   # a-z
-                    (0x30 <= prev <= 0x39) or   # 0-9
-                    prev in (0x20, 0x2E, 0x5F, 0x2D)  # space . _ -
-                )
-                if not is_asciiend:
-                    continue
-                # Sanity: float byte should look plausible
-                first_byte = payload[i + 10]
-                # Accept positive floats 0..~2e5, negative floats, zero, and
-                # digital-point raw bytes (0x00-0x01 range).
-                if first_byte <= 0x48 or first_byte in (0xBF, 0xC0, 0xC1, 0xC2,
-                                                        0xC3, 0xC4, 0xC5):
-                    flags_idx = i + 3
-                    break
+        # Predicate must be tight: 0x0981 enumerate responses contain `01 00 00`
+        # bytes embedded in per-entry metadata (e.g. `01 00 00 04 00 02 00 00`
+        # right after the device-name TLV) whose preceding byte is ASCII —
+        # those false-match a permissive scan. The sentinel at +3..+6 must be
+        # one of the two known shapes (3F FF FF FF wildcard OR all-zero
+        # explicit-flags), and byte +7 (the "reserved" byte of the 3-byte
+        # status group) must be 0x00. Byte +8 (comm_status) is INTENTIONALLY
+        # NOT constrained — it's 0x00 for live and 0x01 for STALE, and an
+        # earlier version of this predicate that required +8 == 0x00 silently
+        # filtered out every comm-faulted response (see PROTOCOL.md
+        # "Comm status (the stale-cache trick)").
+        #
+        # Loop bound: marker (3 bytes) + 7-byte metadata + 4-byte float = 14 bytes,
+        # so the highest valid `i` is len(payload) - 14, i.e. range stop = len - 13.
+        # Off-by-one trap (PROTOCOL.md "Scan-loop bounds for the value block"):
+        # `len(payload) - 14` (one too small) misses the case where the float sits
+        # at the very end of the payload with no trailing data — symptom is digital
+        # points without a units TLV silently failing to parse.
+        for i in range(1, len(payload) - 13):
+            if not (payload[i]   == 0x01 and payload[i+1] == 0x00
+                    and payload[i+2] == 0x00):
+                continue
+            # Sentinel shapes: see PROTOCOL.md "Property state sentinel".
+            # Real value blocks have one of these patterns at +3..+6:
+            #   `3F FF FF XX` — R1 ("quality flags" register), where XX
+            #                   varies on the wire. PROTOCOL.md
+            #                   documents `3F FF FF FF` but the F7 variant
+            #                   (and possibly others — the bit pattern of
+            #                   byte +6 encodes quality flags) is also
+            #                   real and very common in the field.
+            #   `00 00 00 00` — R2/R3 (explicit "all flags clear" / modern
+            #                   compact form).
+            # The 09xx enumerate response's per-entry metadata block
+            # (`04 00 02 00`, `03 00 02 00`, etc. — fixed second byte 0x00,
+            # third byte 0x02) shapes false-match a permissive scan; the
+            # `3F FF FF` prefix check or the all-zero check filters those
+            # out cleanly.
+            sentinel_3fff = (payload[i+3] == 0x3F
+                             and payload[i+4] == 0xFF
+                             and payload[i+5] == 0xFF)
+            sentinel_zero = payload[i+3:i+7] == b'\x00\x00\x00\x00'
+            if not (sentinel_3fff or sentinel_zero):
+                continue
+            if payload[i+7] != 0x00:
+                continue
+            prev = payload[i-1]
+            # Previous byte must be printable ASCII (end of point name string)
+            # Accepted chars: A-Z, a-z, 0-9, space, period, underscore, hyphen
+            is_asciiend = (
+                (0x41 <= prev <= 0x5A) or   # A-Z
+                (0x61 <= prev <= 0x7A) or   # a-z
+                (0x30 <= prev <= 0x39) or   # 0-9
+                prev in (0x20, 0x2E, 0x5F, 0x2D)  # space . _ -
+            )
+            if not is_asciiend:
+                continue
+            # Sanity: float byte should look plausible
+            first_byte = payload[i + 10]
+            # Accept positive floats 0..~2e5, negative floats, zero, and
+            # digital-point raw bytes (0x00-0x01 range).
+            if first_byte <= 0x48 or first_byte in (0xBF, 0xC0, 0xC1, 0xC2,
+                                                    0xC3, 0xC4, 0xC5):
+                flags_idx = i + 3
+                break
 
         if flags_idx < 0:
             # No value block found — probably an error response, a device-summary
@@ -1176,8 +1217,6 @@ class P2Connection:
 
             # Advance cursor with the DEVICE name from this response
             cursor = dev_name.encode('ascii', errors='replace')
-
-        return results
 
         return results
 
@@ -3174,15 +3213,40 @@ def verify_devices(host: str, node_name: str, devices: List[Dict],
         sys.stdout.write(f"\r    Verifying: {i+1}/{total} — {dev_name:<20s}")
         sys.stdout.flush()
 
-        # Read ROOM TEMP and check the comm status flag in the response
-        # The PXC returns cached values even for dead devices, but the
-        # comm_status flag (byte +5 after 3FFFFF) tells us the real status:
-        #   00 = device online (live FLN communication)
-        #   01 = comm fault (device offline, PXC returned stale cached data)
-        #   No 3FFFFF marker = device completely gone from cache
+        # Read ROOM TEMP first. ROOM TEMP is live FLN data, so the
+        # comm_status flag in the response is the authoritative signal
+        # for whether the device is online right now:
+        #   comm_status=='online'      → live FLN read succeeded → ONLINE
+        #   comm_status=='comm_fault'  → PXC handed back a stale-cached
+        #                                value because the device is
+        #                                FLN-faulted. This matches
+        #                                Desigo's own "#COM" indicator
+        #                                on the same point. → OFFLINE
+        #   None (no ROOM TEMP point)  → device doesn't have a ROOM TEMP
+        #                                point at all (some non-VAV apps).
+        #                                Fall through to APPLICATION as a
+        #                                last-resort registration probe.
+        #
+        # NOTE: an earlier version of this routine fell back to
+        # APPLICATION whenever ROOM TEMP came back stale. APPLICATION is
+        # panel-cached metadata (configured app number), not live FLN
+        # data — it returns successfully even for #COM-faulted devices,
+        # so falling back to it converts true offlines into false
+        # onlines. Cross-checked against Desigo CC's own status display
+        # (which shows ROOM TEMP=#COM and APPLICATION=2090 for the same
+        # device): the live signal is comm_status, not APPLICATION
+        # responsiveness.
         result = conn.read_point(dev_name, "ROOM TEMP", node_name.lower())
 
+        dev['status'] = 'offline'
+
+        # Surface comm_status on the dev dict regardless of classification.
+        room_temp_comm = result.get('comm_status') if result else None
+        if room_temp_comm:
+            dev['comm_status'] = room_temp_comm
+
         if result and result.get('comm_status') == 'online':
+            # Live ROOM TEMP read.
             dev['status'] = 'online'
             dev['room_temp'] = result.get('value')
             dev['units'] = result.get('units', '')
@@ -3191,21 +3255,47 @@ def verify_devices(host: str, node_name: str, devices: List[Dict],
                 if app_result and app_result.get('value') is not None:
                     dev['application'] = int(app_result['value'])
             online += 1
-        elif result and result.get('comm_status') == 'comm_fault':
-            # PXC returned stale cached data — device is offline
-            dev['status'] = 'offline'
+            continue
+
+        if result and result.get('comm_status') == 'comm_fault':
+            # PXC explicitly reports the device as FLN-faulted. Record
+            # the stale value (useful for diagnostics — "last seen at...")
+            # but DO NOT mark online. APPLICATION would lie here.
             dev['stale_temp'] = result.get('value')
+            # Best-effort: if the panel still has APPLICATION cached,
+            # surface it so the GUI can still show what the device is
+            # configured as — but the device stays offline.
+            if dev.get('application', 0) == 0:
+                app_result = conn.read_point(dev_name, "APPLICATION", node_name.lower())
+                if app_result and app_result.get('value') is not None:
+                    dev['application'] = int(app_result['value'])
+                    dev['application_cached'] = True
             offline += 1
-        else:
-            # No response or no 3FFFFF marker — try APPLICATION as fallback
-            result2 = conn.read_point(dev_name, "APPLICATION", node_name.lower())
-            if result2 and result2.get('comm_status') == 'online':
-                dev['status'] = 'online'
-                dev['application'] = int(result2['value'])
-                online += 1
-            else:
+            continue
+
+        # No ROOM TEMP response at all (point doesn't exist, parse failed,
+        # or the panel returned an error). Fall through to APPLICATION as
+        # a last-resort probe — for devices without a ROOM TEMP point
+        # this is the only way to confirm they exist. We treat success
+        # here as "online" but flag it as a soft signal.
+        result2 = conn.read_point(dev_name, "APPLICATION", node_name.lower())
+        if result2 and result2.get('value') is not None:
+            app_comm = result2.get('comm_status')
+            if app_comm == 'comm_fault':
+                # Even APPLICATION came back stale — definitely offline.
                 dev['status'] = 'offline'
+                dev['comm_status'] = 'comm_fault'
+                if dev.get('application', 0) == 0:
+                    dev['application'] = int(result2['value'])
+                    dev['application_cached'] = True
                 offline += 1
+            else:
+                dev['status'] = 'online'
+                if dev.get('application', 0) == 0:
+                    dev['application'] = int(result2['value'])
+                online += 1
+        else:
+            offline += 1
 
     conn.close()
 
@@ -3234,9 +3324,19 @@ def verify_devices(host: str, node_name: str, devices: List[Dict],
             else:
                 print(f"    ✓ {dev_name:<20s} {app_str:>8s}  {'':>11s} {desc}")
         else:
+            # Offline: distinguish "FLN comm-faulted (PXC has stale cache)"
+            # from "completely unreachable" so the user can tell whether
+            # the device is wired up but failing or genuinely gone.
             stale = dev.get('stale_temp')
-            stale_str = f"(stale {stale:.0f}°)" if stale is not None else "—"
-            print(f"    ✗ {dev_name:<20s} {'#COM':>8s}  {stale_str:>11s} {desc}")
+            app_str = f"APP {app}" if app else ""
+            if dev.get('comm_status') == 'comm_fault':
+                if stale is not None:
+                    label = f"#COM (cached {stale:.0f}{dev.get('units', '')})"
+                else:
+                    label = "#COM"
+                print(f"    ✗ {dev_name:<20s} {app_str:>8s}  {label:<24s} {desc}")
+            else:
+                print(f"    ✗ {dev_name:<20s} {app_str:>8s}  {'(no response)':<24s} {desc}")
 
     return devices
 

@@ -394,6 +394,33 @@ class NodeTree(ttk.Frame):
         self._tree.tag_configure("status_online", foreground="#0a7a0a")
         self._tree.tag_configure("status_offline", foreground="#a82020")
         self._tree.tag_configure("status_unknown", foreground="#666666")
+        # Amber for FLN comm-fault — distinct from a totally unreachable
+        # device because the panel still has cached data and APPLICATION
+        # is readable. Matches Desigo's #COM convention.
+        self._tree.tag_configure("status_comm_fault", foreground="#a06010")
+        # Node-level status tags. Same color palette as devices but
+        # rendered in bold so the panel's own state stands out from the
+        # devices hanging off it. A node can be online (PXC responding to
+        # P2 handshakes) or offline (TCP refused / handshake failed) —
+        # this lets the user spot a dead PXC even when it has zero FLN
+        # devices, which the device-level Verify can't show.
+        try:
+            import tkinter.font as _tkfont
+            _default = _tkfont.nametofont("TkDefaultFont")
+            _bold = (_default.cget("family"), _default.cget("size"), "bold")
+            self._tree.tag_configure(
+                "node_online", foreground="#0a7a0a", font=_bold
+            )
+            self._tree.tag_configure(
+                "node_offline", foreground="#a82020", font=_bold
+            )
+            self._tree.tag_configure(
+                "node_unknown", foreground="#666666", font=_bold
+            )
+        except Exception:
+            self._tree.tag_configure("node_online", foreground="#0a7a0a")
+            self._tree.tag_configure("node_offline", foreground="#a82020")
+            self._tree.tag_configure("node_unknown", foreground="#666666")
         try:
             import tkinter.font as tkfont
             default = tkfont.nametofont("TkDefaultFont")
@@ -429,12 +456,58 @@ class NodeTree(ttk.Frame):
         if self._network_iid is None:
             self.set_network("")
         assert self._network_iid is not None
+        # Initial status is "unknown" (gray ▸) — flips to online/offline
+        # once any operation against the panel succeeds or fails. The
+        # arrow marker `▸` is kept as the closed-folder hint; we prepend
+        # a status dot when status becomes known.
         iid = self._tree.insert(
-            self._network_iid, "end", text=f"▸  {name}   {ip}", open=False
+            self._network_iid,
+            "end",
+            text=f"▸  {name}   {ip}",
+            open=False,
+            tags=("node_unknown",),
         )
-        self._data[iid] = ("node", {"name": name, "ip": ip})
+        self._data[iid] = (
+            "node",
+            {"name": name, "ip": ip, "status": "unknown"},
+        )
         self._node_iid_by_name[name] = iid
         return iid
+
+    def set_node_status(self, name: str, status: str) -> bool:
+        """Update a node row's status indicator.
+
+        status: 'online', 'offline', or 'unknown'.
+
+        Online means the PXC accepted a TCP connection and completed a
+        P2 handshake; offline means it refused, timed out, or rejected
+        the handshake. This is independent of whether the node has any
+        FLN devices — exactly the signal the device-level Verify can't
+        provide for nodes that only host PPCL programs / global points.
+        """
+        iid = self._node_iid_by_name.get(name)
+        if iid is None:
+            return False
+        entry = self._data.get(iid)
+        if not (entry and entry[0] == "node"):
+            return False
+        ip = entry[1].get("ip", "")
+        marker = {"online": "●", "offline": "○"}.get(status, "▸")
+        tag = {
+            "online": "node_online",
+            "offline": "node_offline",
+        }.get(status, "node_unknown")
+        # Preserve the open/closed state — set_node_status can fire
+        # mid-session and shouldn't snap a folder shut.
+        was_open = bool(self._tree.item(iid, "open"))
+        self._tree.item(
+            iid,
+            text=f"{marker}  {name}   {ip}",
+            tags=(tag,),
+            open=was_open,
+        )
+        entry[1]["status"] = status
+        return True
 
     def clear_nodes(self) -> None:
         """Remove all nodes (and their devices), keep the network root."""
@@ -455,17 +528,34 @@ class NodeTree(ttk.Frame):
 
         for dev in devices:
             status = dev.get("status") or "unknown"
-            marker = {"online": "●", "offline": "○"}.get(status, "◌")
+            comm = dev.get("comm_status")
+            # Distinguish "FLN-faulted but APPLICATION-cached" (amber #COM)
+            # from "totally unreachable" (red ○) and "live" (green ●).
+            # Devices with comm_status='comm_fault' are always classified
+            # offline by the scanner now, but we render them with the
+            # amber tag and a #COM marker so the user can tell at a
+            # glance which are wired-but-failing vs. genuinely missing.
+            if comm == "comm_fault":
+                marker = "◐"
+                tag = "status_comm_fault"
+            else:
+                marker = {"online": "●", "offline": "○"}.get(status, "◌")
+                tag = {
+                    "online": "status_online",
+                    "offline": "status_offline",
+                }.get(status, "status_unknown")
             app = dev.get("application", 0) or 0
-            app_str = f"app {app}" if app else ""
+            app_cached = dev.get("application_cached", False)
+            if app and app_cached:
+                app_str = f"app {app} (cached)"
+            elif app:
+                app_str = f"app {app}"
+            elif comm == "comm_fault":
+                app_str = "#COM"
+            else:
+                app_str = ""
             dev_name = dev["device"]
             label = f"  {marker}  {dev_name:<18s} {app_str}"
-            # Color the row green/red/gray for quick visual scanning of the
-            # device list — the marker character alone is easy to miss.
-            tag = {
-                "online": "status_online",
-                "offline": "status_offline",
-            }.get(status, "status_unknown")
             iid = self._tree.insert(node_iid, "end", text=label, tags=(tag,))
             self._data[iid] = (
                 "device",
@@ -474,9 +564,12 @@ class NodeTree(ttk.Frame):
                     "host": payload_node["ip"],
                     "device": dev_name,
                     "application": app,
+                    "application_cached": app_cached,
                     "status": status,
+                    "comm_status": comm,
                     "description": dev.get("description", ""),
                     "room_temp": dev.get("room_temp"),
+                    "stale_temp": dev.get("stale_temp"),
                     "units": dev.get("units", ""),
                 },
             )
@@ -500,22 +593,43 @@ class NodeTree(ttk.Frame):
                 continue
 
             status = updated.get("status") or entry[1].get("status", "unknown")
+            comm = updated.get("comm_status", entry[1].get("comm_status"))
             app = updated.get("application", entry[1].get("application", 0)) or 0
-            marker = {"online": "●", "offline": "○"}.get(status, "◌")
-            app_str = f"app {app}" if app else ""
+            app_cached = updated.get(
+                "application_cached", entry[1].get("application_cached", False)
+            )
+            if comm == "comm_fault":
+                marker = "◐"
+                tag = "status_comm_fault"
+            else:
+                marker = {"online": "●", "offline": "○"}.get(status, "◌")
+                tag = {
+                    "online": "status_online",
+                    "offline": "status_offline",
+                }.get(status, "status_unknown")
+            if app and app_cached:
+                app_str = f"app {app} (cached)"
+            elif app:
+                app_str = f"app {app}"
+            elif comm == "comm_fault":
+                app_str = "#COM"
+            else:
+                app_str = ""
             label = f"  {marker}  {device_name:<18s} {app_str}"
-            tag = {
-                "online": "status_online",
-                "offline": "status_offline",
-            }.get(status, "status_unknown")
             self._tree.item(child, text=label, tags=(tag,))
 
             # Merge the update into our stored payload so the detail panel
             # picks up fresh data on next selection.
             entry[1]["status"] = status
             entry[1]["application"] = app
+            if comm is not None:
+                entry[1]["comm_status"] = comm
+            if app_cached:
+                entry[1]["application_cached"] = app_cached
             if "room_temp" in updated:
                 entry[1]["room_temp"] = updated["room_temp"]
+            if "stale_temp" in updated:
+                entry[1]["stale_temp"] = updated["stale_temp"]
             if "units" in updated:
                 entry[1]["units"] = updated["units"]
             return True
@@ -542,6 +656,21 @@ class NodeTree(ttk.Frame):
             if parent_entry and parent_entry[0] == "node":
                 return parent_entry[1]
         return None
+
+    def node_payload(self, name: str) -> Optional[Dict]:
+        """Return the stored payload for a node by name.
+
+        Useful when the caller has a node name and wants the latest
+        copy of its payload — including any status updates pushed via
+        set_node_status — without going through the selection machinery.
+        """
+        iid = self._node_iid_by_name.get(name)
+        if iid is None:
+            return None
+        entry = self._data.get(iid)
+        if not (entry and entry[0] == "node"):
+            return None
+        return entry[1]
 
     def select_node(self, name: str) -> None:
         iid = self._node_iid_by_name.get(name)

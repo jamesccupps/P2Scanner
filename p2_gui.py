@@ -996,9 +996,26 @@ class MainWindow:
     def _on_select_node(self, payload: Dict) -> None:
         self._current_node = payload
         self._current_device = None
-        self.detail_header.configure(
-            text=f"Node: {payload['name']}", foreground=""
-        )
+        # Surface the panel's reachability state in the header. payload
+        # may not include status if the node was just added — default
+        # to unknown/gray. The status flips to online/offline whenever a
+        # node-level operation completes (or fails), via
+        # NodeTree.set_node_status, but the payload dict the tree
+        # selection callback hands us reflects whatever was there at
+        # selection time. Pull the latest from the tree directly.
+        latest = self.tree.node_payload(payload["name"]) or payload
+        node_status = latest.get("status", "unknown")
+        status_color = {
+            "online": "#0a7a0a",
+            "offline": "#a82020",
+        }.get(node_status, "")
+        if node_status == "online":
+            header = f"Node: {payload['name']}   (online)"
+        elif node_status == "offline":
+            header = f"Node: {payload['name']}   (offline)"
+        else:
+            header = f"Node: {payload['name']}"
+        self.detail_header.configure(text=header, foreground=status_color)
         self.detail_subhead.configure(text=f"{payload['ip']}   ·   TCP/5033")
 
         fw = self._firmware_cache.get(payload["name"])
@@ -1024,21 +1041,43 @@ class MainWindow:
         self._current_node = None
 
         app_str = f"app {payload.get('application')}" if payload.get("application") else "app unknown"
+        if payload.get("application_cached"):
+            # APPLICATION came from the panel cache for a comm-faulted
+            # device — flag it so the user knows it's not live.
+            app_str += " (cached)"
         status = payload.get("status", "unknown")
+        comm = payload.get("comm_status")
         extras = []
         if payload.get("room_temp") is not None:
             extras.append(
                 f"ROOM TEMP {payload['room_temp']:.1f}{payload.get('units', '') or ''}"
             )
+        elif comm == "comm_fault" and payload.get("stale_temp") is not None:
+            # FLN-faulted: surface the cached value the panel is still
+            # serving, but mark it as stale so it isn't mistaken for live.
+            extras.append(
+                f"ROOM TEMP {payload['stale_temp']:.1f}"
+                f"{payload.get('units', '') or ''} (cached, #COM)"
+            )
         if payload.get("description"):
             extras.append(payload["description"])
         extra_str = "   ·   ".join(extras)
-        status_color = {
-            "online": "#0a7a0a",
-            "offline": "#a82020",
-        }.get(status, "#666666")
+        # Color: green for online, red for offline. For online-but-#COM
+        # (which shouldn't happen with the corrected scanner, but might
+        # arise from race conditions), fall back to amber.
+        if status == "online":
+            status_color = "#a06010" if comm == "comm_fault" else "#0a7a0a"
+        elif status == "offline":
+            status_color = "#a82020"
+        else:
+            status_color = "#666666"
+        # Header label: append #COM tag for comm-faulted devices
+        if comm == "comm_fault":
+            header_label = f"Device: {payload['device']}   ({status} · #COM)"
+        else:
+            header_label = f"Device: {payload['device']}   ({status})"
         self.detail_header.configure(
-            text=f"Device: {payload['device']}   ({status})",
+            text=header_label,
             foreground=status_color,
         )
         self.detail_subhead.configure(
@@ -1118,16 +1157,24 @@ class MainWindow:
             return
         devices = self._node_devices.get(node["name"])
         if not devices:
-            if not messagebox.askyesno(
-                "No enumerated devices",
-                f"No device list for {node['name']} yet. "
-                "Enumerate the FLN bus now?",
-                parent=self.root,
-            ):
-                return
-            # Chain: enumerate then verify. For simplicity we just enumerate
-            # and let the user click Verify again when it finishes.
-            self._enumerate_node()
+            # No FLN devices to verify — but the user still wants to
+            # know whether the PXC itself is reachable. Run a firmware
+            # query as the lightest available "is this panel up?" probe;
+            # the result handler flips the node row to online or
+            # offline. This is especially useful for nodes that only
+            # host PPCL programs / global points and never had devices,
+            # where the device-level Verify would simply do nothing.
+            self.log.log(
+                f"No enumerated devices for {node['name']} — "
+                f"probing PXC reachability instead…"
+            )
+            self._set_busy(f"Probing {node['name']}…")
+            self.runner.submit(
+                ("firmware", node["name"]),
+                self._do_firmware_query,
+                node["ip"],
+                node["name"],
+            )
             return
         self.log.log(
             f"Verifying {len(devices)} devices on {node['name']}…"
@@ -1173,11 +1220,33 @@ class MainWindow:
         try:
             for i, dev in enumerate(devices, start=1):
                 dev_name = dev["device"]
-                # Read ROOM TEMP first — the comm status flag on the response
-                # tells us online/offline even when the PXC returns cached data.
+                # Read ROOM TEMP first. The comm_status flag on the
+                # response is the authoritative live/dead signal — it
+                # matches Desigo's own #COM indicator on the same point.
+                #   comm_status=='online'     → live FLN read → ONLINE
+                #   comm_status=='comm_fault' → PXC returned stale cache
+                #                               because the device is
+                #                               FLN-faulted → OFFLINE
+                #   None (no ROOM TEMP point) → fall through to APPLICATION
+                #                               as a last-resort probe
+                #
+                # NOTE: an earlier version of this loop fell back to
+                # APPLICATION whenever ROOM TEMP came back stale.
+                # APPLICATION is panel-cached metadata (configured app
+                # number), not live FLN data — it returns successfully
+                # even for #COM-faulted devices, so falling back to it
+                # converts true offlines into false onlines. The scanner
+                # was fixed; this mirror has been brought into line.
                 result = conn.read_point(dev_name, "ROOM TEMP", node_lower)
 
+                # Default: offline until proven otherwise
+                dev["status"] = "offline"
+                room_temp_comm = result.get("comm_status") if result else None
+                if room_temp_comm:
+                    dev["comm_status"] = room_temp_comm
+
                 if result and result.get("comm_status") == "online":
+                    # Live ROOM TEMP read.
                     dev["status"] = "online"
                     dev["room_temp"] = result.get("value")
                     dev["units"] = result.get("units", "")
@@ -1189,23 +1258,47 @@ class MainWindow:
                             dev["application"] = int(app_result["value"])
                     online += 1
                 elif result and result.get("comm_status") == "comm_fault":
-                    # PXC returned stale cached data; device offline.
-                    dev["status"] = "offline"
+                    # PXC explicitly reports the device as FLN-faulted.
+                    # Record the stale value (useful for diagnostics) but
+                    # do NOT mark online. APPLICATION would lie here.
                     dev["stale_temp"] = result.get("value")
+                    if "units" not in dev:
+                        dev["units"] = result.get("units", "")
+                    # Best-effort: still surface APPLICATION from the
+                    # panel cache so the GUI can show "app 2090" beside
+                    # the offline indicator (matching what Desigo does).
+                    if dev.get("application", 0) == 0:
+                        app_result = conn.read_point(
+                            dev_name, "APPLICATION", node_lower
+                        )
+                        if app_result and app_result.get("value") is not None:
+                            dev["application"] = int(app_result["value"])
+                            dev["application_cached"] = True
                     offline += 1
                 else:
-                    # No response or no 3FFFFF marker — try APPLICATION as
-                    # a fallback (some devices don't have ROOM TEMP).
+                    # No ROOM TEMP response at all (point doesn't exist on
+                    # this device, parse failed, or panel returned an
+                    # error). Fall back to APPLICATION — for devices
+                    # without a ROOM TEMP point this is the only way to
+                    # confirm they exist. Trust comm_status here too:
+                    # if APPLICATION itself comes back stale, the device
+                    # is offline.
                     app_result = conn.read_point(
                         dev_name, "APPLICATION", node_lower
                     )
-                    if app_result and app_result.get("comm_status") == "online":
-                        dev["status"] = "online"
-                        if app_result.get("value") is not None:
-                            dev["application"] = int(app_result["value"])
-                        online += 1
+                    if app_result and app_result.get("value") is not None:
+                        if app_result.get("comm_status") == "comm_fault":
+                            dev["comm_status"] = "comm_fault"
+                            if dev.get("application", 0) == 0:
+                                dev["application"] = int(app_result["value"])
+                                dev["application_cached"] = True
+                            offline += 1
+                        else:
+                            dev["status"] = "online"
+                            if dev.get("application", 0) == 0:
+                                dev["application"] = int(app_result["value"])
+                            online += 1
                     else:
-                        dev["status"] = "offline"
                         offline += 1
 
                 # Push progress so the UI thread can update the tree row.
@@ -1638,6 +1731,24 @@ class MainWindow:
 
         if status == "error":
             exc, tb = payload
+            # If a node-level operation failed (firmware, enumerate,
+            # walk, programs, verify), the panel itself is likely not
+            # reachable. Flip the node row to offline so the user can
+            # see at a glance which PXC is dead. We restrict this to
+            # node-scoped task kinds — a per-device scan failure
+            # shouldn't repaint the whole node.
+            if (
+                isinstance(task_id, tuple)
+                and len(task_id) >= 2
+                and task_id[0] in (
+                    "firmware",
+                    "enumerate",
+                    "verify",
+                    "walk_points",
+                    "dump_programs",
+                )
+            ):
+                self.tree.set_node_status(task_id[1], "offline")
             # Surface ScannerInputError as a friendly message instead of a stack trace
             if p2 is not None and isinstance(exc, getattr(p2, "ScannerInputError", ())):
                 messagebox.showwarning(
@@ -1687,6 +1798,11 @@ class MainWindow:
         node_name = task_id[1]
         self._node_devices[node_name] = devices
         self.tree.set_node_devices(node_name, devices)
+        # An enumerate that returns successfully means the panel
+        # accepted our handshake and answered the 0x0986 request — the
+        # node is reachable. An empty list (0 devices) is still a
+        # success, just means the panel hosts no FLN devices.
+        self.tree.set_node_status(node_name, "online")
         self.log.log(
             f"Found {len(devices)} device(s) on {node_name}", level="ok"
         )
@@ -1695,22 +1811,46 @@ class MainWindow:
         node_name = task_id[1]
         self._node_devices[node_name] = devices
         self.tree.set_node_devices(node_name, devices)
+        # Verify reached the panel — it's online regardless of how its
+        # downstream FLN devices look.
+        self.tree.set_node_status(node_name, "online")
         online = sum(1 for d in devices if d.get("status") == "online")
         offline = sum(1 for d in devices if d.get("status") == "offline")
-        self.log.log(
-            f"Verify done: {online} online, {offline} offline, "
-            f"{len(devices)} total",
-            level="ok",
+        # #COM-faulted devices are a subset of offline. Surface the count
+        # separately because it's the most common reason a row turns red:
+        # the device is wired up and the panel still has cached data, but
+        # FLN comms with the controller are currently broken.
+        comm_fault = sum(
+            1 for d in devices if d.get("comm_status") == "comm_fault"
         )
+        if comm_fault:
+            self.log.log(
+                f"Verify done: {online} online, {offline} offline "
+                f"({comm_fault} #COM), {len(devices)} total",
+                level="ok",
+            )
+        else:
+            self.log.log(
+                f"Verify done: {online} online, {offline} offline, "
+                f"{len(devices)} total",
+                level="ok",
+            )
 
     def _on_firmware_done(self, task_id: tuple, info: Optional[Dict]) -> None:
         node_name = task_id[1]
         if not info:
+            # Firmware query is the lightest probe we have — if it
+            # failed, the panel isn't reachable. Mark offline.
+            self.tree.set_node_status(node_name, "offline")
             self.log.log(
-                f"No firmware info returned for {node_name}", level="warn"
+                f"No firmware info returned for {node_name} "
+                "(connect failed or handshake rejected — node likely offline)",
+                level="warn",
             )
             return
         self._firmware_cache[node_name] = info
+        # Successful firmware read → panel is up.
+        self.tree.set_node_status(node_name, "online")
         # Build a clean summary line. Compact sysinfo gives us a build date;
         # legacy doesn't.
         parts = [f"model={info.get('model', '?')}"]
@@ -1741,6 +1881,9 @@ class MainWindow:
                 level="warn",
             )
             return
+        # Reaching this point means the panel responded to 0x0981 and
+        # streamed at least one entry — definitively online.
+        self.tree.set_node_status(node_name, "online")
         self.log.log(
             f"{node_name}: {len(entries)} entr{'ies' if len(entries) != 1 else 'y'} walked",
             level="ok",
@@ -1768,6 +1911,8 @@ class MainWindow:
                 level="warn",
             )
             return
+        # Successful PPCL dump → panel responded to opcode 0x0985.
+        self.tree.set_node_status(node_name, "online")
         total_lines = sum(p.get("code", "").count("\n") for p in programs)
         self.log.log(
             f"{node_name}: {len(programs)} program(s), {total_lines} lines",
