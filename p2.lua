@@ -15,19 +15,25 @@
 --
 -- Reload without restarting: Analyze -> Reload Lua Plugins (Ctrl+Shift+L)
 --
--- Coverage notes (update against PROTOCOL.md v12):
+-- Coverage notes (kept in sync with PROTOCOL.md):
 --   * Mode C connections — operational opcodes carried inside 0x2E/0x2F
 --     framing (no transition to 0x33/0x34 ever) are dispatched to the
 --     opcode handler. Detection rule: first 2 bytes after routing header
 --     != 0x4640 -> operational opcode; else -> IdentifyBlock.
---   * Routing-header name ordering is msg-type-dependent. CONNECT and
---     ANNOUNCE put sender in slot 2 and recipient in slot 4 (opposite of
---     DATA/HEARTBEAT). Field labels reflect that.
+--   * Routing-header name ordering is destination-first across ALL message
+--     types (DATA, HEARTBEAT, CONNECT, ANNOUNCE) per the corrected ordering
+--     in PROTOCOL.md "Name ordering". Field labels reflect that.
 --   * Comm-status byte (live vs stale-cache) and data-type byte are
 --     surfaced from the value block — the 0x00/0x01 byte at value-block
 --     offset +6 is the device-comm-fault flag.
 --   * Multicast presence beacon decoder bound to UDP/10001 — payload
---     should always be 4 bytes 01 00 00 00.
+--     should always be 4 bytes 01 00 00 00. Dual-emitted to multicast
+--     233.89.188.1 and broadcast 255.255.255.255 (sub-millisecond delta);
+--     cadence ~10.5s.
+--   * Schedule operations (0x098C-F, 0x5020/22), PPCL editor opcodes
+--     (0x4100/03/04/06), property-write split (0x0240/0x4222 with
+--     0x0E15 wrong-write-opcode error), and alarm pair (0x0508/0x0509)
+--     all dispatched and decoded.
 --
 -- Anything tagged "unknown_opcode" in the dissector output is a candidate
 -- for further protocol analysis. Add new opcodes to OPCODES below as
@@ -429,6 +435,15 @@ end
 -- Returns offset of [01 00 00] value-block marker, or nil. Mirrors the
 -- scanner's _parse_read_response with the documented off-by-one fix:
 -- bound is `len - 13` so payload[i..i+13] is fully addressable.
+--
+-- The predicate must be tight: 0x0981 enumerate responses contain `01 00 00`
+-- bytes embedded in the per-entry metadata block (e.g. `01 00 00 04 00 02 00 00`
+-- right after the device-name TLV) whose preceding byte is the last ASCII
+-- char of the device name. Without sentinel-shape and reserved-byte checks,
+-- those false-match and the dissector decodes garbage floats and a phantom
+-- "comm STALE" tag pulled from whatever bytes happen to follow. Verified
+-- against node11and3pcap.pcapng, where SHAPE A enumerate metadata produces
+-- exactly this confusion.
 local function find_value_block(tvb)
     local len = tvb:len()
     for i = 1, len - 14 do
@@ -436,21 +451,48 @@ local function find_value_block(tvb)
         and tvb(i+1, 1):uint() == 0x00
         and tvb(i+2, 1):uint() == 0x00
         then
-            local prev = tvb(i-1, 1):uint()
-            local is_ascii_end = (prev >= 0x41 and prev <= 0x5A)
-                              or (prev >= 0x61 and prev <= 0x7A)
-                              or (prev >= 0x30 and prev <= 0x39)
-                              or prev == 0x20 or prev == 0x2E
-                              or prev == 0x5F or prev == 0x2D
-            if is_ascii_end then
-                -- Cheap float-leading-byte sanity check
-                local first = tvb(i+10, 1):uint()
-                if first <= 0x48
-                   or first == 0xBF or first == 0xC0 or first == 0xC1
-                   or first == 0xC2 or first == 0xC3 or first == 0xC4
-                   or first == 0xC5
-                then
-                    return i
+            -- Sentinel shapes: see PROTOCOL.md "Property state sentinel".
+            -- Real value blocks have one of these patterns at +3..+6:
+            --   `3F FF FF XX` — R1 ("quality flags" register), where XX
+            --                   varies. PROTOCOL.md documents
+            --                   `3F FF FF FF` but the F7 variant — and
+            --                   probably others — is real and common in
+            --                   the field. Lock only the 3-byte prefix.
+            --   `00 00 00 00` — R2/R3 (explicit "all flags clear" /
+            --                   modern compact form).
+            -- The 09xx enumerate-response per-entry metadata block has
+            -- shapes like `04 00 02 00`, `03 00 02 00`, etc. that
+            -- false-match a permissive scan; either the `3F FF FF`
+            -- prefix or the all-zero check filters them out.
+            local s0 = tvb(i+3, 1):uint()
+            local s1 = tvb(i+4, 1):uint()
+            local s2 = tvb(i+5, 1):uint()
+            local s3 = tvb(i+6, 1):uint()
+            local sentinel_3fff = (s0 == 0x3F and s1 == 0xFF and s2 == 0xFF)
+            local sentinel_zero = (s0 == 0x00 and s1 == 0x00 and s2 == 0x00 and s3 == 0x00)
+            -- Byte +7 is the "reserved" byte of the 3-byte status group
+            -- (sentinel:4 + reserved:1 + comm_status:1 + err/dtype:1).
+            -- Always 0x00 across all observed read responses — including
+            -- STALE responses, where it's byte +8 (comm_status) that flips
+            -- to 0x01, never +7.
+            local reserved_ok = (tvb(i+7, 1):uint() == 0x00)
+            if (sentinel_3fff or sentinel_zero) and reserved_ok then
+                local prev = tvb(i-1, 1):uint()
+                local is_ascii_end = (prev >= 0x41 and prev <= 0x5A)
+                                  or (prev >= 0x61 and prev <= 0x7A)
+                                  or (prev >= 0x30 and prev <= 0x39)
+                                  or prev == 0x20 or prev == 0x2E
+                                  or prev == 0x5F or prev == 0x2D
+                if is_ascii_end then
+                    -- Cheap float-leading-byte sanity check
+                    local first = tvb(i+10, 1):uint()
+                    if first <= 0x48
+                       or first == 0xBF or first == 0xC0 or first == 0xC1
+                       or first == 0xC2 or first == 0xC3 or first == 0xC4
+                       or first == 0xC5
+                    then
+                        return i
+                    end
                 end
             end
         end
