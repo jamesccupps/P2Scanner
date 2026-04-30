@@ -1609,6 +1609,8 @@ Panel replies:  05 "SITEBLN" "DCC-SVR" "SITEBLN" "NODE1" 00 03
 
 The panel did not implement the request (returned `0x0003 not_found`) but still leaked `NODE1` as its canonical name. **A passive observer on any conversation gets the panel's name from the very first response, regardless of payload.** Likewise, an active scanner sending a single garbage request that produces an error gets the panel's name back for free.
 
+**Empirical rate.** Across 6 captures totaling 39,820 P2 frames, 4,573 request/response pairs were checkable for the case-correction leak. Of those, 3,409 (74.5%) showed the lowercase→canonical-case correction (e.g. `node1` request → `NODE1` in slot 4 of the response); 1,164 (25.5%) returned an unrelated frame or didn't fire the leak. The 74.5% rate means a scanner that sends two distinct lowercase guesses to a panel has ≈93.5% probability of harvesting the canonical name from at least one response.
+
 ### 2. `0x4640` IdentifyBlock success response
 
 A successful response to a panel-bound IdentifyBlock request carries the panel's **full identity** as a TLV-encoded body. Sample from a successful exchange:
@@ -1646,7 +1648,7 @@ Different panels carry different application identifiers in the same field — o
 
 Both have `00 XX YY 01 00 04 "SYST" 23 3F FF FF FF` request shapes — the same `SYST`-scoped "give me the system" probe with different opcode bytes:
 
-- **`0x0050`** response body: `01 00 04 "SYST" 23 3F FF FF FF [00 02] 01 00 0A "DCC-SVR" 01 00 00` — the registered supervisor name string. Plus the panel name in routing slot 4. So `0x0050` leaks **panel name + supervisor name** in one round trip. This is the opcode the doc has long marked as the "early shortcut" for cold discovery.
+- **`0x0050`** response body: `01 00 04 "SYST" 23 3F FF FF FF [00 02] 01 00 0A "DCC-SVR" 01 00 00` — the registered supervisor name string. Plus the panel name in routing slot 4. So `0x0050` leaks **panel name + supervisor name** in one round trip. This is the opcode the doc has long marked as the "early shortcut" for cold discovery. Note that `0x0050` returns the supervisor name in its **bare form** (`DCC-SVR`, no `|5034` suffix), while `0x4640` IdentifyBlock returns the **listen-port form** (`DCC-SVR|5034`). Both forms are in use across the protocol — DATA frames and the routing-table-push body use the `|5034` form, CONNECT/ANNOUNCE and `0x0050` use the bare form. A scanner constructing a session identity should prefer `|5034` for DATA traffic.
 - **`0x0606`** response body: empty (`00 00`) — pure ACK. Still leaks the panel name in routing slot 4.
 
 Use `0x0050` when you want supervisor name (for the "scanner attack" step); use `0x0606` when you only want a panel-presence ACK.
