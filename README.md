@@ -2,7 +2,7 @@
 
 Scanner and point-read library for field controllers over the P2 protocol. Runs as a CLI, a Tk GUI, or an importable Python library.
 
-Single Python module, zero external dependencies, read-only by design.
+Pure Python, zero external dependencies, read-only by design.
 
 ---
 
@@ -21,7 +21,7 @@ Single Python module, zero external dependencies, read-only by design.
 - FLN device enumeration
 - PPCL program source dump
 - 797 TEC application definitions bundled — state labels, units, and types
-- Comm-status detection — distinguishes live readings from stale cached data on offline devices
+- Comm-status detection — distinguishes live readings from stale cached data on FLN-faulted devices, matching Desigo's `#COM` indicator
 - Structured error decoding (not silent `None`s)
 
 **I/O**
@@ -37,6 +37,8 @@ Single Python module, zero external dependencies, read-only by design.
 |------|-------------|
 | `p2_scanner.py` | CLI / library. Python 3.6+. |
 | `p2_gui.py`, `p2_gui_widgets.py`, `p2_gui_workers.py` | Tk GUI front-end |
+| `launch_gui_windows.bat` | Windows launcher — runs the GUI under `pythonw` so no console window flashes |
+| `analyze_pcap.py` | Standalone pcap inventory tool — opcode counts, error codes, frame-size distribution, sample bodies for unknowns. Useful for protocol exploration. Requires `tshark`. |
 | `tecpoints.json` | Point definitions for 797 TEC applications |
 | `site.json` | Site-configuration template |
 | `PROTOCOL.md` | Wire-level protocol reference |
@@ -78,8 +80,17 @@ python p2_scanner.py --config site.json -n NODE1 -d DEVICE1 -p "ROOM TEMP"
 ### Launch the GUI
 
 ```bash
+# POSIX (Linux / macOS)
 python p2_gui.py
+
+# Windows — double-click launch_gui_windows.bat, or:
+launch_gui_windows.bat
 ```
+
+The Windows .bat runs the GUI under `pythonw` so there's no console flash. If
+it reports "p2_gui.py not found" with the file actually present, the .bat
+has been corrupted to LF-only line endings — open it in Notepad and re-save
+to restore CRLF.
 
 ---
 
@@ -146,12 +157,24 @@ Each point read produces a result dictionary:
 |-------|-------------|
 | `point_name` | Point name |
 | `point_slot` | Subpoint slot number (1–99) |
-| `value` | Numeric value |
+| `value` | Numeric value (live, or stale-cached if `comm_status='comm_fault'`) |
 | `value_text` | Label for digital points (`"NIGHT"`, `"COOL"`, etc.) |
 | `units` | Engineering units |
 | `point_type` | `analog_ro` / `analog_rw` / `digital_ro` / `digital_rw` |
-| `comm_status` | `online` or `comm_fault` |
+| `comm_status` | `online` (live FLN read) or `comm_fault` (panel returned cached data because the device is FLN-faulted — Desigo's `#COM` indicator) |
+| `comm_error_code` | Panel-reported error byte; `0x06` is the typical comm-fault code |
 | `point_info` | Full metadata (state labels, units, scaling) |
+
+Verify-online operations on a list of devices additionally produce per-device fields:
+
+| Field | Description |
+|-------|-------------|
+| `status` | `online` / `offline` — authoritative classification |
+| `comm_status` | `online` / `comm_fault` — only when the panel reported one |
+| `room_temp` | Live ROOM TEMP value, present for online devices |
+| `stale_temp` | Cached ROOM TEMP value, present for `comm_fault` devices |
+| `application` | App number; populated for online AND `#COM` devices (panel-cached for the latter) |
+| `application_cached` | `True` only when APPLICATION was read from a comm-faulted device's cache |
 
 Table output shows Desigo-style `(slot) NAME` for each point. Digital points render as `LABEL (raw)`. Comm-faulted points get a `#COM` suffix.
 
@@ -228,8 +251,10 @@ The library is synchronous. For a GUI, run reads on a worker thread (see `p2_gui
 | Handshake takes 2+ seconds | First connect to a modern-firmware panel; the dialect auto-probe is doing its thing. Cached on subsequent connects. |
 | Listener hears nothing | Site has multicast disabled — use `--sniff` or `--cold-discover` |
 | "Max peer sessions reached" | Try when other supervisor connections are idle |
-| All device points show `#COM` | FLN bus disconnected |
+| All device points show `#COM` | FLN bus disconnected, or the device-side controller is faulted. Cross-check against Desigo CC's System Manager — it'll show the same `#COM` flag if the fault is real. |
 | Digital point shows raw float instead of label | Read APPLICATION first — use `-n NODE -d DEVICE` so the scanner can auto-detect the app |
+| Windows `launch_gui_windows.bat` says "p2_gui.py not found" but the file IS there | The .bat got LF-only line endings somehow (web upload, Git autocrlf, copy through a Linux box). Open it in Notepad and re-save — Notepad always writes CRLF, which fixes it. |
+| GUI Verify Online shows 0 devices but doesn't tell me if the PXC is up | Click Verify Online anyway — on a no-device node the GUI auto-falls back to a firmware probe, which flips the node row green/red without needing any FLN devices. Or click Firmware directly. |
 
 ---
 
@@ -255,9 +280,9 @@ copy p2.lua %APPDATA%\Wireshark\plugins\
 # Or find your plugin path via Wireshark: Help → About Wireshark → Folders → Personal Lua Plugins
 ```
 
-Restart Wireshark. The dissector auto-attaches to TCP ports 5033 and 5034. Decoded fields appear under the **P2** tree in the packet details pane: opcode names, error codes, sequence numbers, message types, and direction byte.
+Restart Wireshark. The dissector auto-attaches to TCP ports 5033 and 5034. Decoded fields appear under the **P2** tree in the packet details pane: opcode names, error codes, sequence numbers, message types, and direction byte. The decoder also handles 0x0240 / 0x0274 push frames, the routing table 0x4634, alarm pair 0x0508/0x0509, schedule writes 0x5020/0x5022, PPCL editor 0x4100-family, and the property-write fault `0x0E15`. Multicast presence beacons on UDP/10001 are decoded under `p2_beacon`.
 
-The dissector is conservative — it doesn't try to decode every TLV inside payloads, just the framing and opcodes. For deeper byte-level analysis use `analyze_pcap.py` against a saved capture.
+The dissector is conservative — it doesn't try to decode every TLV inside operational payloads, just the framing, opcodes, and the most common request/response shapes. For protocol exploration of an unfamiliar capture, run `analyze_pcap.py` against the saved file — it inventories every opcode, error code, frame-size distribution, and message-type seen, and flags anything not in `KNOWN_OPCODES` so you can spot new opcodes or unfamiliar variants quickly.
 
 ---
 

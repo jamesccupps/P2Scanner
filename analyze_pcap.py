@@ -18,28 +18,134 @@ import sys
 from collections import Counter, defaultdict
 
 
-# Known opcodes from PROTOCOL.md / p2_scanner.py
+# Known opcodes — kept in sync with p2.lua (the canonical authoritative
+# source) and PROTOCOL.md. If a new opcode is added there, mirror it here
+# or this analyzer will flag it as "*** UNKNOWN ***" and drown the real
+# unknowns. The lua dissector's `OPCODES` table is the source of truth.
 KNOWN_OPCODES = {
+    # Sysinfo / firmware
     0x0100: "GetRevString",
     0x010C: "SysInfoCompact",
-    0x0220: "ReadProperty(modern)",
-    0x0240: "WriteWithQuality",
-    0x0271: "ReadProperty(legacy)",
-    0x0273: "WriteNoValue",
+
+    # Status / discovery / panel-name leak
+    0x0050: "StatusQuery",
+    0x0606: "Ping",
+    0x5354: "StatusVariant",
+
+    # Property read / write
+    0x0220: "ReadShort(modern)",
+    0x0271: "ReadExtended(legacy)",
+    0x0272: "ReadExtended-MetaOnly",
+    0x0273: "WriteNoValue/AlarmAck",
     0x0274: "ValuePush/COV",
-    0x0981: "EnumerateAllPoints",
+    0x0240: "WriteWithQuality",
+    0x0241: "Probe",
+    0x0244: "ScopedQuery",
+    0x0245: "TestProbe",
+    0x0291: "Read/write 02xx (rare)",
+    0x0294: "Read variant 02xx (rare)",
+    0x0295: "Read variant 02xx (rare)",
+    0x02A8: "Write variant 02xx (rare)",
+
+    # Object lifecycle
+    0x0203: "ObjectLifecycle 0203",
+    0x0204: "CreateObject",
+    0x0260: "ObjectLifecycle 0260",
+    0x0263: "ObjectLifecycle 0263",
+
+    # Routing / topology
+    0x0368: "NodeRoutingQuery",
+
+    # State-set / metadata
+    0x040A: "MultiStateLabelCatalog",
+
+    # Alarms
+    0x0508: "AlarmReport",
+    0x0509: "AlarmAck",
+
+    # Enumeration / panel walk
+    0x0981: "EnumeratePoints",
+    0x0982: "EnumerateTrended",
+    0x0983: "EnumerateVariant",
+    0x0984: "EnumerateVariant",
     0x0985: "EnumeratePrograms",
     0x0986: "EnumerateFLN",
+    0x0987: "EnumerateVariant",
+    0x0988: "EnumerateMulti",
+    0x0989: "EnumerateVariant",
+    0x099F: "GetPortConfig",
+
+    # Legacy point/title queries
+    0x0961: "AnalogPointQuery(legacy)",
+    0x0964: "TitleAnalogQuery",
+    0x0965: "NodeDiscoveryEnumerate",
+    0x0966: "ShortQuery",
+    0x0969: "ScheduleObjectList",
+    0x0971: "EnhancedPointRead",
+    0x0974: "MultistatePointEnumerate",
+    0x0975: "NodeDiscoveryWithLines",
+    0x0976: "DeviceAllSubpointsRead",
+    0x0979: "ShortVariant",
+    0x098B: "Enumerate(newer)",
+    0x098C: "ScheduleSetpointTable",
+    0x098D: "ScheduleEntries",
+    0x098E: "ScheduleGainConfig",
+    0x098F: "ScheduleDeadband",
+
+    # Newer-firmware capability probes (mostly errors on legacy)
+    0x09A3: "EnumerateNewer",
+    0x09A7: "EnumerateNewer",
+    0x09AB: "EnumerateNewer",
+    0x09BB: "EnumerateNewer",
+    0x09C3: "EnumerateNewer",
+    0x400F: "CapabilityProbe",
+    0x4010: "CapabilityProbe",
+    0x4011: "CapabilityProbe",
+    0x4133: "CapabilityProbe",
+    0x4500: "TestProbe",
+
+    # PPCL editor
+    0x4100: "PPCL LineWrite/Create",
+    0x4103: "PPCL ProgramEnableHint",
+    0x4104: "PPCL LineRead/Delete",
+    0x4106: "PPCL ClearTracebits",
+
+    # Bulk property
+    0x4200: "PropertyQuery",
+    0x4220: "BulkProperty variant",
     0x4221: "BulkPropertyRead",
+    0x4222: "BulkPropertyWrite",
+
+    # Schedule writes
+    0x5003: "ScheduleObjectInfoQuery",
+    0x5020: "ScheduleEntryWrite",
+    0x5022: "ScheduleSlotInit",
+    0x5038: "ObjectDisplayLabels",
+
+    # Routing / identity
     0x4634: "RoutingTable",
     0x4640: "Identify",
 }
 
-KNOWN_ERRORS = {0x0003: "not_found", 0x00AC: "not_supported"}
+# Same: kept in sync with p2.lua's STATUS_ERRORS table.
+KNOWN_ERRORS = {
+    0x0002: "object_unknown (scope-restricted op)",
+    0x0003: "not_found",
+    0x00AC: "not_supported (wrong firmware)",
+    0x0E11: "already_exists (Desigo treats as success)",
+    0x0E15: "wrong-write-opcode (use 0x4222 for SYST)",
+}
 
 MSG_TYPES = {
-    0x2E: "CONNECT", 0x2F: "ANNOUNCE",
-    0x33: "DATA(legacy)", 0x34: "HEARTBEAT(modern)",
+    # PROTOCOL.md "Message types": 0x33 vs 0x34 distinguishes
+    # firmware dialect, NOT data-vs-keepalive. Legacy panels carry
+    # operational traffic in 0x33 DATA; modern panels carry it in
+    # 0x34 HEARTBEAT. Both opcodes and routing format are identical;
+    # only the msg-type byte differs.
+    0x2E: "CONNECT",
+    0x2F: "ANNOUNCE",
+    0x33: "DATA (legacy dialect)",
+    0x34: "HEARTBEAT (modern dialect)",
 }
 
 DIR_BYTES = {0x00: "Request", 0x01: "Success", 0x05: "Error"}
