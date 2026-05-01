@@ -4,6 +4,8 @@ Scanner and point-read library for field controllers over the P2 protocol. Runs 
 
 Pure Python, zero external dependencies, read-only by design.
 
+> **Looking to expose APOGEE panels as BACnet/IP?** See **[P2_BACnet_Bridge](https://github.com/jamesccupps/P2_BACnet_Bridge)** — a read-only bridge built on this scanner that surfaces every P2 point as a BACnet object, so any modern supervisor (Desigo CC, Niagara, EBI, Tridium-anything) can read APOGEE PXCs as native BACnet devices.
+
 ---
 
 ## Features
@@ -289,3 +291,8 @@ The dissector is conservative — it doesn't try to decode every TLV inside oper
 ## See also
 
 - **[PROTOCOL.md](PROTOCOL.md)** — wire-level protocol reference. Every opcode, every format variant, every edge case. Read this if you're debugging unusual responses, implementing your own client, or just curious how a BAS protocol works on the wire.
+
+## Related projects
+
+- **[P2_BACnet_Bridge](https://github.com/jamesccupps/P2_BACnet_Bridge)** — Read-only bridge that uses this scanner as a library to expose APOGEE PXC controllers as BACnet/IP devices. Lets Desigo CC, Niagara, EBI, and other modern supervisors read APOGEE panels natively. Tk configurator GUI, persistent point manifest, FLN per-point reads + bulk panel-internal enumerate.
+- **[HVAC-Network-Scanner](https://github.com/jamesccupps/HVAC-Network-Scanner)** — Multi-protocol BACnet scanner for commercial building automation networks. Complementary to this scanner — covers BACnet/IP discovery while P2 Scanner covers Siemens APOGEE.
