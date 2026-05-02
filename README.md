@@ -22,7 +22,7 @@ Pure Python, zero external dependencies, read-only by design.
 - Full-panel walk — every point on a controller, including panel-internal variables
 - FLN device enumeration
 - PPCL program source dump
-- 797 TEC application definitions bundled — state labels, units, and types
+- 700+ TEC application definitions bundled — state labels, units, and types
 - Comm-status detection — distinguishes live readings from stale cached data on FLN-faulted devices, matching Desigo's `#COM` indicator
 - Structured error decoding (not silent `None`s)
 
