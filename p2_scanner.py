@@ -23,6 +23,7 @@ import argparse
 import json
 import csv
 import re
+import secrets
 from datetime import datetime
 from collections import OrderedDict
 from typing import Optional, Dict, List, Tuple, Any
@@ -531,7 +532,11 @@ class P2Connection:
         self.network = network if network is not None else P2_NETWORK
         self.scanner_name = scanner_name if scanner_name is not None else SCANNER_NAME
         self.sock: Optional[socket.socket] = None
-        self.sequence = 1
+        # Start sequence at a random 24-bit value matching real Desigo behavior.
+        # PROTOCOL.md "Sequence number field" + corpus analysis show real DCC
+        # uses session-monotonic seqs in the millions; seq=0 / seq=1 is a clear
+        # scanner fingerprint and may be rejected by stricter future firmware.
+        self.sequence = secrets.randbits(24)
         self.node_name = None      # Learned from responses
         self._recv_buffer = b""
         # Dialect detection — see _handshake() for why this matters.
@@ -601,15 +606,28 @@ class P2Connection:
             # Fresh timestamp on every attempt. PXCs may reject handshakes with
             # suspiciously old timestamps from the same scanner — rebuilding it
             # per attempt keeps the retry clean.
+            #
+            # Trailer layout (16 bytes total) per PROTOCOL.md Connection-handshake
+            # section, verified against the corpus:
+            #   1 byte   separator (0x00)
+            #   3 bytes  flags (0x01 0x01 0x00)  — third byte is the role flag;
+            #            0x00 = "configured peer" (DCC-style), what we want
+            #   5 bytes  reserved zeros
+            #   4 bytes  timestamp (BE u32, Unix epoch seconds)
+            #   2 bytes  session id (0x00 0x00 = panel-style; bouncer accepts;
+            #            real DCC uses per-session non-zero values but copying
+            #            one risks colliding with an active session)
+            #   1 byte   trailing null
             return (
                 b'\x46\x40' +
                 b'\x01\x00' + bytes([len(scanner)]) + scanner +
                 b'\x01\x00' + bytes([len(site)]) + site +
                 b'\x01\x00' + bytes([len(net)]) + net +
-                b'\x00\x01\x01' +
-                b'\x00\x00\x00\x00\x00' +
-                struct.pack('>I', int(time.time())) + b'\x00' +
-                b'\xfe\x98\x00'
+                b'\x00\x01\x01\x00' +                  # separator + 3 flag bytes
+                b'\x00\x00\x00\x00\x00' +              # 5 reserved zeros
+                struct.pack('>I', int(time.time())) + # 4-byte timestamp
+                b'\x00\x00' +                          # 2-byte session id
+                b'\x00'                                # trailing null
             )
 
         # Cache lookup — skip probing if we've talked to this panel before.
@@ -2746,15 +2764,18 @@ def probe_p2_host(host: str) -> Optional[Dict[str, str]]:
         for seq, target_name in enumerate(probe_names, start=100):
             target = target_name.encode('ascii')
             routing = b'\x00' + net + b'\x00' + target + b'\x00' + net + b'\x00' + scanner + b'\x00'
+            # Trailer per PROTOCOL.md "Connection handshake" — see _handshake()
+            # in P2Connection for the byte layout.
             identity = (
                 b'\x46\x40' +
                 b'\x01\x00' + bytes([len(scanner)]) + scanner +
                 b'\x01\x00' + bytes([len(site)]) + site +
                 b'\x01\x00' + bytes([len(net)]) + net +
-                b'\x00\x01\x01' +
-                b'\x00\x00\x00\x00\x00' +
-                struct.pack('>I', int(time.time())) + b'\x00' +
-                b'\xfe\x98\x00'
+                b'\x00\x01\x01\x00' +                  # separator + 3 flag bytes
+                b'\x00\x00\x00\x00\x00' +              # 5 reserved zeros
+                struct.pack('>I', int(time.time())) + # 4-byte timestamp
+                b'\x00\x00' +                          # 2-byte session id
+                b'\x00'                                # trailing null
             )
             payload = routing + identity
             msg = struct.pack('>III', 12 + len(payload), 0x33, seq) + payload
@@ -2966,11 +2987,18 @@ def get_node_info(host: str, node_name: str) -> Optional[Dict]:
         b'\x46\x40\x01\x00' + bytes([len(scanner)]) + scanner +
         b'\x01\x00' + bytes([len(site)]) + site +
         b'\x01\x00' + bytes([len(net)]) + net +
-        b'\x00\x01\x01\x00\x00\x00\x00\x00' +
-        struct.pack('>I', int(time.time())) + b'\x00\xfe\x98\x00'
+        # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
+        # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
+        # See PROTOCOL.md "Connection handshake" for the documented format.
+        b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
+        struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
     )
-    hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, 1) + routing + identity
-    hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, 1) + routing + identity
+    # Random 24-bit seq matches real Desigo behavior — see PROTOCOL.md
+    # "Sequence number field". Both dialect probes share the seq so they
+    # look like alternative attempts of one handshake.
+    _hs_seq = secrets.randbits(24)
+    hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, _hs_seq) + routing + identity
+    hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, _hs_seq) + routing + identity
 
     dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
     if dialect is None:
@@ -3078,11 +3106,18 @@ def enumerate_fln_devices(host: str, node_name: str) -> List[Dict]:
         b'\x46\x40\x01\x00' + bytes([len(scanner)]) + scanner +
         b'\x01\x00' + bytes([len(site)]) + site +
         b'\x01\x00' + bytes([len(net)]) + net +
-        b'\x00\x01\x01\x00\x00\x00\x00\x00' +
-        struct.pack('>I', int(time.time())) + b'\x00\xfe\x98\x00'
+        # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
+        # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
+        # See PROTOCOL.md "Connection handshake" for the documented format.
+        b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
+        struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
     )
-    hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, 1) + routing + identity
-    hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, 1) + routing + identity
+    # Random 24-bit seq matches real Desigo behavior — see PROTOCOL.md
+    # "Sequence number field". Both dialect probes share the seq so they
+    # look like alternative attempts of one handshake.
+    _hs_seq = secrets.randbits(24)
+    hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, _hs_seq) + routing + identity
+    hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, _hs_seq) + routing + identity
 
     dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
     if dialect is None:
@@ -3381,12 +3416,16 @@ def discover_devices_on_node(host: str, node_name: str,
         b'\x01\x00' + bytes([len(scanner)]) + scanner +
         b'\x01\x00' + bytes([len(site)]) + site +
         b'\x01\x00' + bytes([len(net)]) + net +
-        b'\x00\x01\x01\x00\x00\x00\x00\x00' +
-        struct.pack('>I', int(time.time())) + b'\x00\xfe\x98\x00'
+        # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
+        # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
+        # See PROTOCOL.md "Connection handshake" for the documented format.
+        b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
+        struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
     )
     hb_payload = routing_hb + identity
-    hs_0x33 = struct.pack('>III', 12 + len(hb_payload), 0x33, 1) + hb_payload
-    hs_0x34 = struct.pack('>III', 12 + len(hb_payload), 0x34, 1) + hb_payload
+    _hs_seq = secrets.randbits(24)  # See PROTOCOL.md "Sequence number field"
+    hs_0x33 = struct.pack('>III', 12 + len(hb_payload), 0x33, _hs_seq) + hb_payload
+    hs_0x34 = struct.pack('>III', 12 + len(hb_payload), 0x34, _hs_seq) + hb_payload
 
     dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
     if dialect is None:
@@ -4008,11 +4047,14 @@ def _cold_probe(host: str, bln: str, scanner: str, node: str,
         b'\x01\x00' + bytes([len(scanner_b)]) + scanner_b +
         b'\x01\x00' + bytes([len(site_b)]) + site_b +
         b'\x01\x00' + bytes([len(bln_b)]) + bln_b +
-        b'\x00\x01\x01\x00\x00\x00\x00\x00' +
-        struct.pack('>I', int(time.time())) + b'\x00\xfe\x98\x00'
+        # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
+        # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
+        # See PROTOCOL.md "Connection handshake" for the documented format.
+        b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
+        struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
     )
     payload = routing + identity
-    frame = struct.pack('>III', 12 + len(payload), 0x33, 1) + payload
+    frame = struct.pack('>III', 12 + len(payload), 0x33, secrets.randbits(24)) + payload
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

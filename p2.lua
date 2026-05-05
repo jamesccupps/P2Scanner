@@ -74,11 +74,18 @@ local OPCODES = {
     [0x5354] = "Unknown 0x5354 (always errors 0x0003)",
 
     -- Reads
-    [0x0220] = "ReadShort (modern dialect, compact)",
+    [0x0220] = "ReadShort (modern dialect, compact; small + 273B preallocated)",
     [0x0271] = "ReadExtended (legacy dialect)",
     [0x0272] = "ReadExtended-MetaOnly (no value sentinel)",
-    [0x0273] = "WriteNoValue / AlarmAck-trigger",
+    [0x0273] = "WriteNoValue / PointExistenceProbe / AlarmAckTrigger (UI browse + alarm-ack)",
     [0x0274] = "ValuePush (5033 push-write / 5034 COV — direction-dependent)",
+
+    -- Bare-opcode session pings (PXC->DCC, 2 bytes total, panel-specific)
+    [0x0951] = "BarePing 0951 (panel-specific 2-byte keepalive)",
+    [0x0954] = "BarePing 0954 (panel-specific 2-byte keepalive)",
+    [0x0955] = "BarePing 0955 (panel-specific 2-byte keepalive)",
+    [0x0956] = "BarePing 0956 (panel-specific 2-byte keepalive)",
+    [0x0959] = "BarePing 0959 (panel-specific 2-byte keepalive)",
 
     -- Writes
     [0x0240] = "WriteWithQuality (NONE-device virtual writes)",
@@ -532,16 +539,11 @@ end
 
 ------------------------------------------------------------------------
 -- Routing header
--- PROTOCOL.md "Routing header" claims slot 2/4 ordering depends on msg
--- type — that CONNECT/ANNOUNCE put sender in slot 2, recipient in slot 4
--- (opposite of DATA/HEARTBEAT). EMPIRICAL FINDING: real captures of
--- panel-initiated CONNECT/ANNOUNCE (PXC reaching back to DCC's 5033 in
--- Mode C) put **destination** in slot 2 and **source** in slot 4 — the
--- DATA/HEARTBEAT convention — and the IdentifyBlock body's first TLV
--- agrees with slot 4, not slot 2. So we label slot 2 as Destination and
--- slot 4 as Source for ALL message types. The doc's table appears to be
--- wrong, or applies only to a Mode A handshake from supervisor side that
--- the test corpus didn't include.
+-- PROTOCOL.md "Routing header → Name ordering" (and "References and
+-- corrections to common misunderstandings") both state: slot 2 is the
+-- destination, slot 4 is the source, for ALL message types. Verified
+-- across 162,688 frames in the May 2026 corpus. The IdentifyBlock body's
+-- first TLV agrees with slot 4 (sender's self-name).
 ------------------------------------------------------------------------
 
 -- Parses [dir][BLN\0][slot2\0][BLN\0][slot4\0]. Returns body offset.

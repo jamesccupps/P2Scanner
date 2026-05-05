@@ -38,8 +38,8 @@ These are **not** operation opcodes — they are the `msg_type` byte at offset 0
 |---|---|---|
 | `0x0203` | ObjectLifecycle (probe) | Sibling of `0x0204`; corpus only shows client-debug names |
 | `0x0204` | CreateObject | Returns `0x0E11` if name is taken |
-| `0x0220` | ReadShort | Desigo CC's preferred compact read |
-| `0x0240` | WriteWithQuality | 5034 BLN virtual push; errors `0x0E15` against SYST properties |
+| `0x0220` | ReadShort | Desigo CC's preferred compact read. Small (~83B) and 273-byte preallocated descriptor-fetch variants both observed. |
+| `0x0240` | WriteWithQuality | **Two distinct shapes by direction:** 5033/SYST/sep=0x23 (DCC→PXC supervisor write — errors `0x0E15`, Desigo retries with `0x4222`); 5034/NONE/sep=0x00 (PXC→DCC virtual push, accepted). |
 | `0x0241` | (unknown) | SYST-prefixed property-op, semantics unconfirmed (4 samples) |
 | `0x0244` | Scope-restricted read | Returns `0x0002` out-of-scope; variant of `0x0240` |
 | `0x0245` | (test probe) | Always errors — cold-probe captures only, not a real op |
@@ -47,7 +47,7 @@ These are **not** operation opcodes — they are the `msg_type` byte at offset 0
 | `0x0263` | ObjectLifecycle | Object delete-related |
 | `0x0271` | ReadExtended | Legacy full-value read; trailer `00 FF` |
 | `0x0272` | ReadExtended-MetaOnly | Same shape as `0x0271`, no trailing sentinel; descriptor lookup |
-| `0x0273` | WriteNoValue / AlarmAckTrigger | Trailer `00 00`; precedes `0x0509` in alarm-ack flows |
+| `0x0273` | WriteNoValue / PointExistenceProbe / AlarmAckTrigger | Trailer `00 00`. **Dominant usage** is Desigo's UI point-existence probe — walks every subpoint of a device. Also precedes `0x0509` in alarm-ack flows (minority case; ~500× less common than browsing usage). |
 | `0x0274` | ValuePush / COVNotification | Bidirectional — direction determines semantics |
 | `0x0291` | (write variant) | SYST + value bytes after `0x23` separator |
 | `0x0294` | (read variant) | Two body shapes: 53-byte (`0x00` sep) and 222-byte preallocated (`0x01` sep) |
@@ -136,7 +136,7 @@ Carried inside `0x2E` CONNECT frames mid-session, **2 bytes total** after the ro
 
 | Opcode | Name | Notes |
 |---|---|---|
-| `0x4634` | PushRoutingTable | Body is list of `{TLV name, u32 BE cost}` tuples; ACK-only response |
+| `0x4634` | PushRoutingTable | Body is list of `{TLV name, u32 BE cost}` tuples; ACK-only response. **Observed on both 5033 and 5034** — port-agnostic; cost is per-observer (each sender computes a different number for the same node). |
 | `0x4640` | IdentifyBlock | Handshake payload + mid-session identity refresh. Desigo cadence: every **10.0 s exactly** per TCP connection |
 
 ### Schedule property writes / misc — `50xx` and others
