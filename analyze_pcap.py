@@ -12,6 +12,7 @@ Surfaces:
 
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 import sys
@@ -251,7 +252,16 @@ def consume_segment(segment_data, src_ip, src_port, dst_ip, dst_port):
 
 
 def main():
-    pcap = sys.argv[1] if len(sys.argv) > 1 else "/mnt/user-data/uploads/50335034.pcapng"
+    if len(sys.argv) < 2:
+        print("Usage: analyze_pcap.py <pcap_file>", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Inventories opcodes, error codes, frame-size distribution,", file=sys.stderr)
+        print("and message-type counts in a P2 capture. Requires tshark on PATH.", file=sys.stderr)
+        sys.exit(2)
+    pcap = sys.argv[1]
+    if not os.path.isfile(pcap):
+        print(f"[ERROR] pcap not found: {pcap}", file=sys.stderr)
+        sys.exit(2)
 
     # Pull every P2-relevant TCP segment
     print(f"[*] reading {pcap} via tshark...")
@@ -262,7 +272,18 @@ def main():
            "-e", "ip.src", "-e", "tcp.srcport",
            "-e", "ip.dst", "-e", "tcp.dstport",
            "-e", "tcp.payload"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        print("[ERROR] tshark not found on PATH. Install Wireshark (which", file=sys.stderr)
+        print("        includes tshark) and ensure the install directory is", file=sys.stderr)
+        print("        on your PATH.", file=sys.stderr)
+        sys.exit(2)
+    if proc.returncode != 0:
+        print(f"[ERROR] tshark exited with code {proc.returncode}", file=sys.stderr)
+        if proc.stderr:
+            print(proc.stderr.rstrip(), file=sys.stderr)
+        sys.exit(2)
     lines = proc.stdout.strip().split("\n")
     print(f"[*] {len(lines)} TCP segments to process")
 
