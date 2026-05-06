@@ -94,6 +94,13 @@ it reports "p2_gui.py not found" with the file actually present, the .bat
 has been corrupted to LF-only line endings — open it in Notepad and re-save
 to restore CRLF.
 
+The reciprocal can happen on Linux / macOS: if `launch_gui_linux.sh` was
+checked out with CRLF endings (common when cloned through a Windows machine
+with `core.autocrlf=true`), bash reports `bash\r: No such file or directory`
+and refuses to run. Fix: `dos2unix launch_gui_linux.sh` or
+`sed -i 's/\r$//' launch_gui_linux.sh`. The repo's `.gitattributes` pins
+`*.sh` to LF on checkout, so this should not happen on a fresh clone.
+
 ---
 
 ## Command reference
@@ -255,7 +262,8 @@ The library is synchronous. For a GUI, run reads on a worker thread (see `p2_gui
 | "Max peer sessions reached" | Try when other supervisor connections are idle |
 | All device points show `#COM` | FLN bus disconnected, or the device-side controller is faulted. Cross-check against Desigo CC's System Manager — it'll show the same `#COM` flag if the fault is real. |
 | Digital point shows raw float instead of label | Read APPLICATION first — use `-n NODE -d DEVICE` so the scanner can auto-detect the app |
-| Windows `launch_gui_windows.bat` says "p2_gui.py not found" but the file IS there | The .bat got LF-only line endings somehow (web upload, Git autocrlf, copy through a Linux box). Open it in Notepad and re-save — Notepad always writes CRLF, which fixes it. |
+| Windows `launch_gui_windows.bat` says "p2_gui.py not found" but the file IS there | The .bat got LF-only line endings somehow (web upload, Git autocrlf, copy through a Linux box). Open it in Notepad and re-save — Notepad always writes CRLF, which fixes it. The repo's `.gitattributes` should prevent this on fresh clones. |
+| Linux `launch_gui_linux.sh` reports `bash\r: command not found` or `No such file or directory` | The `.sh` got CRLF line endings on checkout (Windows autocrlf). Run `dos2unix launch_gui_linux.sh` or `sed -i 's/\r$//' launch_gui_linux.sh`. The repo's `.gitattributes` pins `.sh` to LF, so this only affects checkouts that predate that file. |
 | GUI Verify Online shows 0 devices but doesn't tell me if the PXC is up | Click Verify Online anyway — on a no-device node the GUI auto-falls back to a firmware probe, which flips the node row green/red without needing any FLN devices. Or click Firmware directly. |
 
 ---
