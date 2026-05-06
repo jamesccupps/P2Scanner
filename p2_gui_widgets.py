@@ -1801,10 +1801,10 @@ HELP_SECTIONS: List[Tuple[str, str]] = [
           "it involves probe bursts that warrant their own delay flags "
           "and warnings."),
     ("p", "Run from a terminal in the scanner folder:"),
-    ("code", "    python p2_scanner.py --cold-discover --range 10.0.0.0/24 --save site.json"),
+    ("code", "    python p2_scanner.py --cold-discover --range 192.0.2.0/24 --save site.json"),
     ("p", "Add --cold-delay 2 during production hours for a 2-second pause "
           "between probes. On sites that have Siemens MulticastEnabled on, "
-          "you can skip probes entirely with --listen 60 (passive listen "
+          "you can skip probes entirely with --listen-push 60 (passive listen "
           "for BLN multicast announcements). See the main p2_scanner "
           "README for the full flag list and safety notes."),
     ("p", "Caveat — cold-discover uses legacy-dialect probes only. On an "

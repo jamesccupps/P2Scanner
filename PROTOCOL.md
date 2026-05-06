@@ -5,7 +5,7 @@ Siemens APOGEE P2 is the building-automation protocol used by Siemens PXC contro
 - Wireshark captures of live supervisor ↔ PXC traffic across multiple firmware revisions
 - Empirical probing against PXC controllers under controlled conditions
 - Cross-referencing observed wire behavior against the vendor's point-definition metadata
-- Packet captures from a multi-panel reference site running a mixed PME1252 / PME1300 firmware mix, totalling several MB of traffic and thousands of messages:
+- Packet captures from a multi-panel reference corpus running a mixed PME1252 / PME1300 firmware mix, totalling several MB of traffic and thousands of messages:
   - **5033-side baseline** (~1.6 MB, ~7900 messages, 188 TCP flows) — all 5033-side traffic; the baseline for polling behavior.
   - **Server-side full capture** (~4.6 MB) covering TCP 5033, TCP 5034, and BACnet — exposes the PXC→supervisor push channel.
   - **PPCL-enumeration capture** — supervisor-side capture of a scanner probing one panel. Contains ~100 consecutive `0x0985` calls — the reference for decoding the PPCL enumerate protocol.
@@ -29,6 +29,8 @@ Siemens APOGEE P2 is the building-automation protocol used by Siemens PXC contro
 Every stream across all captures parsed cleanly against the framing rules below with zero desyncs.
 
 Treat every claim here as "observed to be true in tested environments, not officially documented."
+
+**Note on sanitization.** All identifiers in this document — IP addresses, BLN names, panel/device/point names, BACnet object descriptions, equipment tags — are sanitized examples. IPs use RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`). BLN names use the placeholder `SITEBLN`. Panel-name placeholders use `NODE<n>`. Equipment descriptions are generalized (e.g., `Floor-N DXRS` instead of any real floor designation). Numerical statistics (frame counts, packet counts, percentages, intervals) are taken from a real multi-pcap analysis corpus and are reported with their original precision; the analysis is real, the identifiers are not.
 
 **Terminology note.** The network on which P2 runs is called the **BLN** (Building Level Network) in original APOGEE documentation and the **ALN** (Automation Level Network) in newer Desigo-era Siemens documentation — the two names refer to the same network layer. Above it sits the **MLN** (Management Level Network) where Desigo CC / Insight workstations live; below it sits the **FLN** (Field Level Network, running the P1 protocol) where TEC devices live. This document uses BLN throughout, consistent with APOGEE-era naming and the panels it describes.
 
@@ -65,7 +67,7 @@ Beacon characteristics:
 
 **Dual emission**: each beacon is sent twice in immediate succession — once to the multicast group, once to the directed broadcast — typically within 1 millisecond of each other from the same source (observed deltas range 0.000–0.460 ms across the corpus, with most pairs <100 µs apart). This redundancy presumably ensures presence detection works regardless of whether the receiving switch has IGMP snooping configured. Earlier captures saw only the multicast variant because their SPAN port filtered broadcast frames; a comprehensive any-interface capture surfaces both. The 10.50-second inter-pair cadence is consistent across every capture in the corpus and across multiple sources on multi-VLAN sites, so it is a hardcoded interval rather than a configurable timer.
 
-**Corpus-wide statistics (51 pcaps from the reference site):** 1040 beacon packets observed across 26 pcaps. Every one carries the identical 4-byte payload `01 00 00 00` (zero variation in 1040 samples). Two unique source IPs: `10.0.0.1` (547 packets, HVAC VLAN gateway) and `10.0.1.1` (493 packets, HVAC-Ext VLAN 6 gateway). Two destinations: `233.89.188.1` (534 packets) and `255.255.255.255` (506 packets). Of 906 inter-emission intervals, 474 fall in the [10.0 s, 11.0 s] band (the real cadence — median 10.4906 s, max 10.6546 s) and 415 are sub-millisecond (the multicast/broadcast pair-emission deltas). The pattern is mechanically regular.
+**Corpus-wide statistics (51 pcaps from the analyzed corpus):** 1040 beacon packets observed across 26 pcaps. Every one carries the identical 4-byte payload `01 00 00 00` (zero variation in 1040 samples). Two unique source IPs: `192.0.2.1` (547 packets, HVAC VLAN gateway) and `198.51.100.1` (493 packets, HVAC-Ext VLAN gateway). Two destinations: `233.89.188.1` (534 packets) and `255.255.255.255` (506 packets). Of 906 inter-emission intervals, 474 fall in the [10.0 s, 11.0 s] band (the real cadence — median 10.4906 s, max 10.6546 s) and 415 are sub-millisecond (the multicast/broadcast pair-emission deltas). The pattern is mechanically regular.
 
 The beacon is a presence-announcement, not a discovery query — it carries no node name, no BLN identifier, no routing data. A scanner that wanted to use it for site discovery would see only "something Siemens-shaped is alive on this segment" and would still need to brute-force-attempt the TCP handshake to identify specific nodes. The cartesian-attack discovery flow documented later remains the reliable approach.
 
@@ -363,9 +365,9 @@ Within Mode C there are **two sub-variants**, distinguished by what's in the ver
 - DCC→PXC:5033 — DCC initiates, sends schedule operations (`0x0961`, `0x0969`, `0x0974`)
 - PXC→DCC:5033 — PXC initiates, sends reads (`0x0271`) or alarm reports (`0x0508`)
 
-The PXC-initiated Mode C connections all target the **DCC's port 5033**. This means at least at the reference site, the DCC service listens on **both 5033 and 5034**. (Many references describe DCC as "5034-only" — that may be a deployment-specific simplification. Treat 5033/5034 as both-ways-listenable in any robust scanner.)
+The PXC-initiated Mode C connections all target the **DCC's port 5033**. This means at least at the reference corpus, the DCC service listens on **both 5033 and 5034**. (Many references describe DCC as "5034-only" — that may be a deployment-specific simplification. Treat 5033/5034 as both-ways-listenable in any robust scanner.)
 
-Sample headless Mode C flow from the schedule-edit capture, supervisor `10.0.0.10:55811 → 10.0.0.20:5033`:
+Sample headless Mode C flow from the schedule-edit capture, supervisor `192.0.2.10:55811 → 192.0.2.20:5033`:
 
 ```
 Frame  Type  Direction  Opcode   Notes
@@ -714,7 +716,7 @@ A previously undocumented family of `09xx` opcodes drives Desigo CC's weekly-sch
 | `0x0971` | EnhancedPointRead | Like `0x0981` but with extra trailing config bytes | Description + value + units + resolution + min + max + type-code | More complete than `0x0981`. Returned `ROOM TEMP = 71.75 °F`, resolution `0.25`, max `48.0` for one tested point. Use this when a UI needs limits, not just current value |
 | `0x0974` | MultistatePointEnumerate | Like `0x0964` but state-set-aware | Object name + current state index + state-set ref | Used for points like `EXAMPLE.HP.ZN/MODE` — pulls current multistate value plus the cursor reference into the matching state-set |
 | `0x0975` | NodeDiscoveryWithLines | Cursor + line-number trailer like `0x0985` | Node + line + column index | Used to map PPCL programs to nodes. Sample returned `NODE9TEST / D / 00010 C / 0A` |
-| `0x0976` | DeviceAllSubpointsRead | `[01 00 04 "SYST"][01 00 LL <device>]` plus 2-byte slot count | App number (u16) + description + per-slot `(slot_index, f32)` tuples | Powerful "give me everything on this device" op. Sample returned app=`0x07E7` (= 2023, indicating the application code), description "VAV-19", and 18 (slot, value) pairs |
+| `0x0976` | DeviceAllSubpointsRead | `[01 00 04 "SYST"][01 00 LL <device>]` plus 2-byte slot count | App number (u16) + description + per-slot `(slot_index, f32)` tuples | Powerful "give me everything on this device" op. Sample returned app=`0x07E7` (= 2023, indicating the application code), description "VAV-X", and 18 (slot, value) pairs |
 | `0x0979` | ShortVariant | `0x0976`-like body with trailing `02 71` | Variable | The `02 71` trailer references opcode `0x0271` (extended point read). Looks like a "cross-opcode lookup" — request says "use 0x0271 semantics on this object" |
 | `0x098B` | NewerFeature | `0x0981`-shape | 100% `0x0003`/`0x00AC` on PME1252 | Newer-firmware enumerate. Captures show Desigo trying it, panels rejecting it |
 | `0x098C` | ScheduleSetpointTable | `[01 00 04 "SYST"][01 00 LL <schedule>]` | 5–7 floats representing temperature setpoints | Sample returned `[32.0, 68.0, 53.6, 78.8, 86.0]` °F — a heating/cooling setpoint band table |
@@ -771,7 +773,7 @@ Request:
 09 76                           opcode
 00 00                           separator
 01 00 04 "SYST"                 scope tag
-01 00 LL <device-name>          target device, e.g. "VAV-19"
+01 00 LL <device-name>          target device, e.g. "VAV-X"
 00 NN                           u8 slot count expected (or 0x00 = all)
 ```
 
@@ -782,7 +784,7 @@ Response:
 00 00
 01 00 LL <device-name>          echoed back
 07 E7                            u16 BE app-number (e.g. 0x07E7 = APOGEE app code 2023)
-01 00 LL <description>          human-readable, e.g. "VAV-19"
+01 00 LL <description>          human-readable, e.g. "VAV-X"
 00 NN                            u8 entry count
 [per entry:]
   00 SS                          u8 slot index (1..NN)
@@ -1395,7 +1397,7 @@ Sent when a device-point value changes enough to cross the COV threshold. The fo
 ```
 [routing header: BLN / dest=supervisor / BLN / src=panel]
 02 74 00 01 00 00             opcode + header
-01 00 0A "VAV-12"         device TLV
+01 00 LL "<device>"         device TLV
 01 00 09 "ROOM TEMP"          point TLV
 42 90 00 00                   f32 BE value (72.0 °F)
 00 00 00 00 00 00 00 00 00 00 00 00 00   trailer padding
@@ -1758,7 +1760,7 @@ APDU:    10 07                       (Unconfirmed-Request, service=0x07 Who-Has)
          09 00                       (context-tag 0: low instance limit = 0)
          1B 3F FF FF                 (context-tag 1: high instance limit = max)
          3D 0A 00                    (context-tag 3: objectName, length 10, charset 0)
-         "ACM_RM416"                 the leaked string
+         "XYZ_RM###"                 the leaked string
 ```
 
 A scanner that wants the site code without sending any packet binds to UDP/47808, filters for BVLC `0x0B` + APDU `10 07`, and extracts the context-tag-3 objectName from each frame. Apply regex `^([A-Z]{2,6})[._]` to the captured names; the most-frequent prefix is the site code. In all three corpus captures, the site code surfaced within the first 10 seconds of capture.
@@ -1814,8 +1816,8 @@ Option (b) is operationally cleanest if the vantage is available. Option (a) is 
 
 **For BACnet-bridged Siemens devices** (PXCC/PXCM compact and modular controllers exposed via BACnet, e.g., the `1xx000`-instance devices typical of Siemens commissioning):
 
-- BACnet Method C (Who-Is + ReadProperty) gives complete site fingerprint plus equipment context (e.g., `AHU-1`, `EXHAUST FANS`, `10TH FLOOR DXRS`).
-- These BACnet-side controllers may be a **different inventory** than the P2 panels. At the reference site, 0 of 8 P2 panels appeared in BACnet I-Am responses — the BACnet plane and P2 plane were completely disjoint inventories.
+- BACnet Method C (Who-Is + ReadProperty) gives complete site fingerprint plus equipment context (e.g., `AHU-1`, `EXHAUST FANS`, `Floor-N DXRS`).
+- These BACnet-side controllers may be a **different inventory** than the P2 panels. At the reference corpus, 0 of 8 P2 panels appeared in BACnet I-Am responses — the BACnet plane and P2 plane were completely disjoint inventories.
 - For HVAC tooling that just needs to identify equipment by building system, BACnet Method C is sufficient. For P2 session work, BACnet provides no useful bridge.
 
 ### Practical caveat: case-sensitivity for the BLN name
@@ -1842,7 +1844,7 @@ The bouncer's BLN check appears to be **case-sensitive**: `SITEBLN` works, `site
 - **MSTP gateway traffic** — BACnet-over-P2 tunneling may use a different opcode set when PXCs bridge to third-party BACnet devices.
 - **Backup/restore, firmware-upload** — distinct opcode sets used by Siemens' engineering tools, out of scope.
 - **Opcodes `0x09A3 / 0x09A7 / 0x09AB / 0x09BB / 0x400F–0x4133`** — supervisor sends them, PXC rejects with `00 AC`; probably newer-firmware features. Not mapped.
-- **Modern PME1300 panel behavior — peer-registration side effect** — the runtime-peer-registration side effect from inbound `msg_type = 0x2E` CONNECT has only been verified against a PME1252. The PME1300 panel (NODE11) at the reference site shares the same handshake, cadence, and trailer format as PME1252 (verified in the May 2026 corpus) — but the listener test for runtime-peer registration hasn't been run against it. Worth verifying against NODE11 (PME1300 V2.8.18).
+- **Modern PME1300 panel behavior — peer-registration side effect** — the runtime-peer-registration side effect from inbound `msg_type = 0x2E` CONNECT has only been verified against a PME1252. The PME1300 panel (NODE11) at the reference corpus shares the same handshake, cadence, and trailer format as PME1252 (verified in the May 2026 corpus) — but the listener test for runtime-peer registration hasn't been run against it. Worth verifying against NODE11 (PME1300 V2.8.18).
 - **Cold-discovery from non-supervisor vantage for legacy P2-only panels** — no zero-cost single-frame primitive has been found. Tested negatively: arbitrary slot-2 strings (silent drop), active 0x4634 query (TCP RST), BACnet ReadProperty (returns BACnet name not P2 name; legacy panels often don't appear in BACnet at all). Open paths: Siemens proprietary BACnet properties (vendor-id 7) untested; UDP discovery protocols other than BACnet untested. mDNS surfacing of `*.siemens-bms.local` is now confirmed available — locates the supervisor itself but not the P2 panel names.
 
 ### Resolved by May 2026 corpus analysis
@@ -1962,7 +1964,7 @@ End-to-end testing against a live PME1252 panel established that the bouncer enf
 
 Slot 4 (the source identity), the IdentifyBlock self-name TLV, and the IdentifyBlock site/BLN body fields are **NOT enforced** beyond consistency with each other. A scanner can identify itself as any string (e.g., `p2-scanner`) and the panel will accept the connection and respond with full identity blocks. **A read-only scanner does not need to impersonate the supervisor** — it just needs to know the BLN and a panel name to establish a session.
 
-Verified by direct comparison of two probes against the same panel (NODE6 at the reference site):
+Verified by direct comparison of two probes against the same panel (NODE6 at the reference corpus):
 - `slot 4 = "DCC-SVR"` (impersonating supervisor) → 86-byte response, then full SystemInfo dump
 - `slot 4 = "p2-scanner"` (arbitrary scanner name) → 86-byte response with identical structure
 
@@ -1989,7 +1991,7 @@ Real Desigo CC frames use a session-monotonic sequence number that increments pe
 
 A scanner running on the supervisor host itself sees DCC↔panel traffic natively (no SPAN required) — this is a *privileged* vantage equivalent to "owning the supervisor." A scanner running on an arbitrary host on the same VLAN sees only broadcast traffic (Surface 7) and its own active probes. Most cold-discovery surfaces (5, 6) require the supervisor-host or SPAN vantage. Tools that claim to work "without SPAN" need to be tested from a non-supervisor host to verify the claim.
 
-**Field-test result, reference site:** A 90-second passive listen with `scapy.sniff` from a non-supervisor host (a regular workstation IP) on the HVAC VLAN observed 0 Surface 5 frames, 0 Surface 6 frames, and 14 Surface 7 broadcasts. Surface 7 (BACnet Who-Has) works from any segment-local host as expected. Surfaces 5 and 6 (P2 unicast TCP/5033 traffic) were not visible. The site's network is properly switched — DCC↔panel unicast traffic does not reach segment hosts.
+**Field-test result, reference corpus:** A 90-second passive listen with `scapy.sniff` from a non-supervisor host (a regular workstation IP) on the HVAC VLAN observed 0 Surface 5 frames, 0 Surface 6 frames, and 14 Surface 7 broadcasts. Surface 7 (BACnet Who-Has) works from any segment-local host as expected. Surfaces 5 and 6 (P2 unicast TCP/5033 traffic) were not visible. The site's network is properly switched — DCC↔panel unicast traffic does not reach segment hosts.
 
 An earlier corpus capture from the same VLAN that DID contain DCC↔panel frames was, on confirmation with the site operator, captured on the Desigo CC server itself, not on a separate workstation. That capture is consistent with privileged-vantage observation; it does not indicate that an unprivileged host can see Surfaces 5/6.
 
@@ -1997,13 +1999,13 @@ The supervisor-host or SPAN-port requirement for Surfaces 5 and 6 is binding on 
 
 ### Panel persistent reconnect side effect — `msg_type = 0x2E` registers a runtime peer
 
-**This finding's framing has been substantially revised after observing that production read-only scanners that emulate Desigo CC (using `msg_type = 0x33` with inner `0x4640` as the initial frame) do not trigger this behavior across many panels at the reference site, while a verification probe tool (using `msg_type = 0x2E` as the initial frame) did trigger it.** The corrected interpretation: this is documented protocol behavior that depends on the initial CONNECT envelope's `msg_type`, not a generic "any CONNECT triggers it" vulnerability.
+**This finding's framing has been substantially revised after observing that production read-only scanners that emulate Desigo CC (using `msg_type = 0x33` with inner `0x4640` as the initial frame) do not trigger this behavior across many panels at the reference corpus, while a verification probe tool (using `msg_type = 0x2E` as the initial frame) did trigger it.** The corrected interpretation: this is documented protocol behavior that depends on the initial CONNECT envelope's `msg_type`, not a generic "any CONNECT triggers it" vulnerability.
 
 #### Initial-frame `msg_type` distinguishes role
 
 The protocol uses two different envelope types for the initial frame on a fresh TCP session, and the panel treats them differently:
 
-- **Initial frame `msg_type = 0x33` (DCC-style: `0x33` envelope with inner `0x4640` IdentifyBlock)** — supervisor-to-panel pattern. Panels respond to reads/CONNECTs but do not register the source as a peer. This is what real Desigo CC sends at the reference site, and what well-behaved read-only scanners send. The doc's *Connection-handshake modes* table calls this "the alternative `0x33` + inner `0x4640` initiation path" of the Mode A flow. **Verified safe across many panels at the reference site over an extended period of production scanning.**
+- **Initial frame `msg_type = 0x33` (DCC-style: `0x33` envelope with inner `0x4640` IdentifyBlock)** — supervisor-to-panel pattern. Panels respond to reads/CONNECTs but do not register the source as a peer. This is what real Desigo CC sends at the reference corpus, and what well-behaved read-only scanners send. The doc's *Connection-handshake modes* table calls this "the alternative `0x33` + inner `0x4640` initiation path" of the Mode A flow. **Verified safe across many panels at the reference corpus over an extended period of production scanning.**
 
 - **Initial frame `msg_type = 0x2E` (panel-style: `0x2E` CONNECT carrying `0x4640` IdentifyBlock directly)** — panel-to-supervisor pattern. This is the message a real panel sends to its real supervisor when the panel comes online. The doc's *Connection-handshake modes* table calls this the textbook "Mode A: Standard handshake" form. The panel that receives a `0x2E` CONNECT from a non-panel-named source past the bouncer treats it as a peer announcing itself, records the source IP as a runtime peer, and persistently calls back to that source on a 16-second cadence. **This is by-design announce-then-supervise protocol behavior, not a parser bug.**
 
@@ -2011,7 +2013,7 @@ The bouncer's check is purely on BLN + slot 2 routing; it does NOT validate that
 
 #### Reference site state — what created it
 
-A PME1252 V2.8.10 panel (NODE6) at the reference site entered this registered-peer state because a verification probe tool deliberately used `msg_type = 0x2E` CONNECTs to characterize the panel's response to panel-style frames. The probe at 20:04:07 UTC on 2026-04-30 had:
+A PME1252 V2.8.10 panel (NODE6) at the reference corpus entered this registered-peer state because a verification probe tool deliberately used `msg_type = 0x2E` CONNECTs to characterize the panel's response to panel-style frames. The probe at 20:04:07 UTC on 2026-04-30 had:
 
 - `msg_type = 0x2E`
 - `slot 1 (BLN) = SITEBLN` (passes bouncer)
@@ -2083,7 +2085,7 @@ Application-layer retransmit cadence (~14-15s) is slightly tighter than TCP-leve
 
 **Avoid sending `msg_type = 0x2E` as the initial frame on a fresh TCP session unless you specifically want to be tracked as a peer.** A `0x2E` initial frame from a non-panel source is interpreted as a panel announcing itself — the panel will register your IP and call back persistently. There's no documented way to "deregister" without panel reboot.
 
-A production read-only scanner used at the reference site sends `msg_type = 0x33` with inner `0x4640` IdentifyBlock as its initial frame and has scanned panels at the reference site over extended periods without triggering this state. This is empirical confirmation that the protocol's role discrimination works correctly when scanners use the appropriate envelope.
+A production read-only scanner used at the reference corpus sends `msg_type = 0x33` with inner `0x4640` IdentifyBlock as its initial frame and has scanned panels at the reference corpus over extended periods without triggering this state. This is empirical confirmation that the protocol's role discrimination works correctly when scanners use the appropriate envelope.
 
 #### Why this matters for the protocol's security model
 
@@ -2109,7 +2111,7 @@ The panel apparently classifies `0x4634` as a sender-role-restricted opcode: onl
 
 ### BACnet vs P2 naming — two distinct namespaces
 
-A subtle but important finding. Siemens Apogee panels live on two protocol planes simultaneously (BACnet/IP on UDP/47808 and P2 on TCP/5033), and they have different names on each. Verified by direct comparison at the reference site:
+A subtle but important finding. Siemens Apogee panels live on two protocol planes simultaneously (BACnet/IP on UDP/47808 and P2 on TCP/5033), and they have different names on each. Verified by direct comparison at the reference corpus:
 
 | Panel | BACnet object-name | BACnet description | P2 canonical name |
 |-------|---------------------|---------------------|--------------------|
@@ -2117,13 +2119,13 @@ A subtle but important finding. Siemens Apogee panels live on two protocol plane
 | BACnet-capable PXCC | `SITE_PXCC102000` | `EXHAUST FANS` | not present in P2 inventory |
 | Legacy P2-only panel | (not in BACnet — PME1252 V2.8.10) | n/a | `NODE6` |
 | BACnet-capable PXCM | `SITE_PXCM103000` | `AHU-1` | not present in P2 inventory |
-| BACnet-capable PXCC | `SITE_PXCC104000` | `10TH FLOOR DXRS` | not present in P2 inventory |
+| BACnet-capable PXCC | `SITE_PXCC104000` | `Floor-N DXRS` | not present in P2 inventory |
 
 The BACnet name is descriptive and includes the instance number; the P2 name is short and canonical (`NODE<n>`). They're **not** simple transformations of each other.
 
-The BACnet `description` property (property ID 28) was field-tested as a possible bridge between namespaces. The result: descriptions contain **mechanical/equipment tags** (e.g., `AHU-1`, `EXHAUST FANS`, `10TH FLOOR DXRS`) — useful for HVAC asset management but not for P2 routing. The description does not expose the panel's P2 canonical name.
+The BACnet `description` property (property ID 28) was field-tested as a possible bridge between namespaces. The result: descriptions contain **mechanical/equipment tags** (e.g., `AHU-1`, `EXHAUST FANS`, `Floor-N DXRS`) — useful for HVAC asset management but not for P2 routing. The description does not expose the panel's P2 canonical name.
 
-**Most important finding from the cross-protocol test at the reference site: the BACnet inventory and the P2 panel inventory are completely disjoint.** Of 8 confirmed P2 panels (8 PME1252 + 1 PME1300), 0 appeared in BACnet I-Am responses. Of the BACnet-discoverable Siemens devices found, none responded to P2 CONNECT on TCP/5033. The two planes have distinct device populations even though both carry the same site-code prefix in their naming conventions.
+**Most important finding from the cross-protocol test at the reference corpus: the BACnet inventory and the P2 panel inventory are completely disjoint.** Of 8 confirmed P2 panels (8 PME1252 + 1 PME1300), 0 appeared in BACnet I-Am responses. Of the BACnet-discoverable Siemens devices found, none responded to P2 CONNECT on TCP/5033. The two planes have distinct device populations even though both carry the same site-code prefix in their naming conventions.
 
 **Implication for cold-discovery:** The BACnet ReadProperty primitive (Method C in the runbook) reliably gives you (a) the site code, (b) the BACnet device inventory, and (c) the panels' mechanical/equipment context. It does **not** give you the P2 panel name needed for slot 2 of a P2 CONNECT.
 
@@ -2133,11 +2135,11 @@ To go from BACnet name to P2 name, three approaches remain plausible:
 2. **Cross-correlate via passive observation** — observe both BACnet and P2 traffic from the same source IP and match by timing/structure (requires Surface 5/6 vantage).
 3. **Probe the panel's P2 plane with candidate names** seeded from convention (e.g., known patterns like `NODE<n>` for panels in the `1xx000` BACnet instance range, where `n` may correlate to the instance number).
 
-For panels that don't speak BACnet at all (PME1252 V2.8.10 generation, like the reference site's `NODE6`), the BACnet path is unavailable and discovery must use Surface 5/6 passive observation (with appropriate vantage) or active P2 probing.
+For panels that don't speak BACnet at all (PME1252 V2.8.10 generation, like the reference corpus's `NODE6`), the BACnet path is unavailable and discovery must use Surface 5/6 passive observation (with appropriate vantage) or active P2 probing.
 
 ### Example: BACnet inventory extracted via cold-discovery
 
-Field testing at the reference site produced this verified inventory using only the BACnet primitives — Method C + description ReadProperty — from a non-supervisor host on the HVAC VLAN. IPs are sanitized; the layout is what a real cold-discovery run produces:
+Field testing at the reference corpus produced this verified inventory using only the BACnet primitives — Method C + description ReadProperty — from a non-supervisor host on the HVAC VLAN. IPs are sanitized; the layout is what a real cold-discovery run produces:
 
 | Role | BACnet instance | Object name | Equipment context |
 |------|-----------------|-------------|-------------------|
@@ -2145,7 +2147,7 @@ Field testing at the reference site produced this verified inventory using only 
 | Secondary supervisor | 9998 | `Desigo CC 9998` | Secondary Desigo CC workstation |
 | Compact PXC | 101000 | `SITE_PXCC101000` | (no equipment description) |
 | Compact PXC | 102000 | `SITE_PXCC102000` | Exhaust fans controller |
-| BACnet/MSTP router | 103100 | `SITE_HV1_BACROUTER` | BACnet/IP→MS/TP router for an air handler |
+| BACnet/MSTP router | 103100 | `SITE_RTR1_BACROUTER` | BACnet/IP→MS/TP router for an air handler |
 | Modular PXC | 103000 | `SITE_PXCM103000` | Air handler controller |
 | Compact PXC | 104000 | `SITE_PXCC104000` | Floor-N DXRS controller |
 | Modular PXC | 106000 | `SITE_PXCM106000` | Floor DXRS controller |
@@ -2155,7 +2157,7 @@ This gives a scanner enough to map building IPs to building systems using BACnet
 
 ### Multi-pcap corpus validation (May 2026)
 
-A 58-pcap corpus totalling 162,688 P2 frames from the reference site was analyzed end-to-end. The corpus included steady-state polling, DCC supervisor traffic, panel CONNECT exchanges, alarm raise/ack sequences, schedule edits, PPCL program reads, and a complete operator-initiated setpoint-write workflow (50→40 °F round-trip on a flow-min setpoint). Findings that **resolve open questions** or **add wire-format detail** are summarized below.
+A 58-pcap corpus totalling 162,688 P2 frames from the reference corpus was analyzed end-to-end. The corpus included steady-state polling, DCC supervisor traffic, panel CONNECT exchanges, alarm raise/ack sequences, schedule edits, PPCL program reads, and a complete operator-initiated setpoint-write workflow (50→40 °F round-trip on a flow-min setpoint). Findings that **resolve open questions** or **add wire-format detail** are summarized below.
 
 #### Opcode coverage — complete
 
@@ -2237,7 +2239,7 @@ The corpus has 10,200 0x0240 frames. They split into two clearly distinct shapes
 **5033-side (DCC→PXC, SYST-scoped — supervisor write of a device property)**:
 ```
 0240 0100 04 "SYST" 23 3fffffff 0000      ← scope=SYST, separator byte 0x23
-01 00 LL <device_name>                     ← device TLV (e.g. "VAV-101")
+01 00 LL <device_name>                     ← device TLV (e.g. "VAV-X")
 01 00 LL <point_name>                      ← point TLV (e.g. "CLG FLOW MIN")
 00 00 0100 00 0100 00 <4-byte float>       ← value as IEEE-754 BE float
 23                                          ← trailing 0x23
@@ -2363,7 +2365,7 @@ Routing slot 4 destinations show **case variation**: panels in DCC→PXC traffic
 
 The site captures show two multicast traffic types:
 
-- **`233.89.188.1:10001` from network gateway IPs (10.0.0.1, 10.0.1.1)**: 4-byte payload `01 00 00 00`. Source is a switch/gateway, not a panel. The 4-byte size is too short to carry node identity. Likely a router beacon, **not** the panel-presence beacon the doc earlier referenced. (Treat the prior "Multicast presence beacons (UDP 10001 / 233.89.188.1)" framing with caution — that may have been a different traffic type observed in different captures, or a misinterpretation.)
+- **`233.89.188.1:10001` from network gateway IPs (192.0.2.1, 198.51.100.1)**: 4-byte payload `01 00 00 00`. Source is a switch/gateway, not a panel. The 4-byte size is too short to carry node identity. Likely a router beacon, **not** the panel-presence beacon the doc earlier referenced. (Treat the prior "Multicast presence beacons (UDP 10001 / 233.89.188.1)" framing with caution — that may have been a different traffic type observed in different captures, or a misinterpretation.)
 - **mDNS / LLMNR (`224.0.0.251:5353`, `224.0.0.252:5355`)** from the DCC: `<site>-bms-svr.local` self-advertising via standard mDNS. Useful for locating a Desigo CC server on a flat network without P2 access — `dns-sd` against the local subnet would surface the supervisor.
 
 Cold-discovery side note: an mDNS query for `_*._tcp.local.` against an HVAC VLAN can name-tag the Desigo CC server by its hostname (e.g. `<site>-bms-svr.local`). Useful as Surface 0 — finds the supervisor IP without requiring any P2 traffic, and the hostname often carries the site code prefix.
@@ -2413,7 +2415,7 @@ These changes are fully backwards-compatible with the existing PME1252/PME1300 p
 
 ## Empirical validation status
 
-What's been tested end-to-end against live PXCs on the reference site — both PME1252 V2.8.10 legacy-dialect panels and a PME1300 V2.8.18 modern-dialect panel:
+What's been tested end-to-end against live PXCs on the reference corpus — both PME1252 V2.8.10 legacy-dialect panels and a PME1300 V2.8.18 modern-dialect panel:
 
 | Capability | Method | Status |
 |------------|--------|--------|
@@ -2436,10 +2438,10 @@ What's been tested end-to-end against live PXCs on the reference site — both P
 | Compact sysinfo | `0x010C` | ✓ Returns model/firmware/build date |
 | Legacy sysinfo | `0x0100` | ✓ Returns same fields in different layout |
 | pcap decoding | Offline | ✓ Parses all 52 captures cleanly across the corpus |
-| **BACnet Method C cold-discovery** | **Who-Is + ReadProperty** | **✓ Verified at the reference site: returns BACnet inventory + equipment tags + site code prefix** |
-| **Bouncer slot-2 strictness** | **8 non-name variants** | **✓ Verified at the reference site: 8/8 silent drops, no leak** |
+| **BACnet Method C cold-discovery** | **Who-Is + ReadProperty** | **✓ Verified at the reference corpus: returns BACnet inventory + equipment tags + site code prefix** |
+| **Bouncer slot-2 strictness** | **8 non-name variants** | **✓ Verified at the reference corpus: 8/8 silent drops, no leak** |
 | **Active 0x4634 query** | **Inside 0x33 DATA frame** | **✗ Verified rejected: panel TCP-RST within 3ms** |
-| **Surface 7 BACnet broadcast (any vantage)** | **scapy passive listen UDP/47808** | **✓ Verified at the reference site: 14 broadcasts in 90s from non-supervisor host** |
+| **Surface 7 BACnet broadcast (any vantage)** | **scapy passive listen UDP/47808** | **✓ Verified at the reference corpus: 14 broadcasts in 90s from non-supervisor host** |
 | **Surfaces 5/6 (non-supervisor vantage)** | **scapy passive listen TCP/5033** | **✗ Verified NOT visible: 0/0 frames from non-supervisor host on properly-segmented network** |
 | **Initial-frame `msg_type = 0x2E` registers source as runtime peer** | **Inbound `msg_type = 0x2E` as initial frame on a fresh TCP session, with valid BLN + slot 2 case-folding to a real panel name, registers source IP as a runtime peer; panel calls back every ~16s with `flags = 01 01 01`; persists across sessions until reboot** | **△ Verified by listener test against NODE6 (PME1252 V2.8.10); production scanners using `msg_type = 0x33` + inner `0x4640` initial frame do NOT trigger this; this is documented protocol behavior, not a vulnerability per se** |
 
@@ -2501,7 +2503,7 @@ Most published BAS scanners ship the vendor catalog as a static data file alongs
 - **BLN name** — required for the bouncer
 - **Site code** — typically a 3-letter prefix
 - **Scanner identity** — slot 4 / IdentifyBlock self-name (any string; the bouncer doesn't validate it)
-- **Panel name → IP mapping** — `NODE1 → 10.0.0.10`, etc.
+- **Panel name → IP mapping** — `NODE1 → 192.0.2.10`, etc.
 - **Panel-local points** — names of PPCL variables or virtual points the integrator defined, which won't be in the vendor catalog
 - **Application overrides** — if the integrator built a custom application, its slot layout
 
@@ -2792,7 +2794,7 @@ def read_one(pxc_ip: str, panel: bytes, device: bytes, point: bytes,
         s.close()
 
 # Usage:
-# value = read_one("10.0.0.42", panel=b"panel1", device=b"TEC1", point=b"TEMP")
+# value = read_one("192.0.2.42", panel=b"panel1", device=b"TEC1", point=b"TEMP")
 # print(f"reading: {value}")  # → 72.5
 ```
 
@@ -2986,7 +2988,7 @@ This is the harvest step that runs *after* you have the BLN (from any of A–D).
 In practice:
 - **If the site uses a documented Siemens convention** (`NODE1`, `NODE2`, ..., `NODEn`), the lowercase guess `node1...nodeN` will hit immediately for any real panel.
 - **If the site uses a non-default convention** (e.g., `AS1`, `STATION1`, `<BUILDING>_PXC1`), Method E requires that you include those candidates in the guess list. Without inside knowledge or pattern observation, the search space is unbounded.
-- **For the typical reference site convention** (`NODE<n>` with `n` as a small integer): a Phase 1 scan of N panels usually maps cleanly to `NODE1..NODEN` via this method.
+- **For the typical reference corpus convention** (`NODE<n>` with `n` as a small integer): a Phase 1 scan of N panels usually maps cleanly to `NODE1..NODEN` via this method.
 
 For each panel from Phase 1:
 1. Open TCP/5033 to the panel
@@ -2999,7 +3001,7 @@ For each panel from Phase 1:
 
 If Method A or B was used, you already have all panel names from the topology dump and can skip Method E entirely. Method E exists for the C/D path where you only have the BLN — and even then, it only works if your candidate names happen to include real panel-name variants.
 
-**Caveat — initial frame `msg_type = 0x2E` registers the source as a runtime peer:** sending an initial frame with `msg_type = 0x2E` to a panel with valid BLN + bouncer-passing slot 2 causes the panel to register the source IP as a runtime peer and call back persistently (~16-second cadence, `flags = 01 01 01`) until panel reboot. **This is documented protocol behavior** — `0x2E` CONNECT is the panel-online-announcement envelope. Read-only scanners should use **`msg_type = 0x33` with inner `0x4640` IdentifyBlock as their initial frame** (the form the doc's *Connection-handshake modes* table calls "the alternative `0x33` + inner `0x4640` initiation path"), which is what real Desigo CC sends and does not register the source. A production read-only scanner at the reference site uses this form exclusively and has scanned panels there over extended periods without triggering registration. See *Field-testing findings → Panel persistent reconnect side effect* for full details.
+**Caveat — initial frame `msg_type = 0x2E` registers the source as a runtime peer:** sending an initial frame with `msg_type = 0x2E` to a panel with valid BLN + bouncer-passing slot 2 causes the panel to register the source IP as a runtime peer and call back persistently (~16-second cadence, `flags = 01 01 01`) until panel reboot. **This is documented protocol behavior** — `0x2E` CONNECT is the panel-online-announcement envelope. Read-only scanners should use **`msg_type = 0x33` with inner `0x4640` IdentifyBlock as their initial frame** (the form the doc's *Connection-handshake modes* table calls "the alternative `0x33` + inner `0x4640` initiation path"), which is what real Desigo CC sends and does not register the source. A production read-only scanner at the reference corpus uses this form exclusively and has scanned panels there over extended periods without triggering registration. See *Field-testing findings → Panel persistent reconnect side effect* for full details.
 
 ```python
 def harvest_panel_name(panel_ip, bln, scanner_identity=b"p2-scanner|5034", msg_type=0x34):
@@ -3033,7 +3035,7 @@ After Phases 1–3 the scanner emits, per panel:
 
 ```json
 {
-  "ip": "10.0.0.X",
+  "ip": "192.0.2.X",
   "mac": "00:a0:03:XX:XX:XX",
   "vendor": "Siemens",
   "tcp_5033_open": true,
@@ -3055,7 +3057,7 @@ After Phases 1–3 the scanner emits, per panel:
   "p2_bln": "MYBLN",
   "supervisor_name": "DCC-SVR",
   "supervisor_5034_name": "DCC-SVR|5034",
-  "supervisor_ip": "10.0.0.X",
+  "supervisor_ip": "192.0.2.X",
   "bms_name": "SITE-BMS",
   "panel_count": 11,
   "discovery_method": "A",

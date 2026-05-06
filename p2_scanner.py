@@ -8,8 +8,8 @@ and queries firmware information — all over TCP/5033.
 
 Quick Start:
     python p2_scanner.py --pcap capture.pcapng                              # Learn network name
-    python p2_scanner.py --discover --range 10.0.0.0/24 --network MYBLN     # Find everything
-    python p2_scanner.py -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
+    python p2_scanner.py --discover --range 192.0.2.0/24 --network MYBLN     # Find everything
+    python p2_scanner.py -n 192.0.2.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN  # Read a point
 
 Protocol: TCP/5033, Siemens Apogee P2 Ethernet
 Wire format derived from protocol analysis of network captures.
@@ -1330,9 +1330,9 @@ class P2Connection:
         # Compound-name detection. Some panels return entries with TWO ASCII
         # name TLVs in a row at the top of the body (instead of one name + an
         # empty-TLV separator). Example:
-        #     01 00 04 BCCW  01 00 07 DAY.NGT  02 00 02 00 00 ...
+        #     01 00 04 ZN01  01 00 07 DAY.SCH  02 00 02 00 00 ...
         # vs normal:
-        #     01 00 07 BAY.OCC  01 00 00  02 00 02 00 00 ...
+        #     01 00 07 RM TEMP  01 00 00  02 00 02 00 00 ...
         # The second name is a sub-key (some kind of subfield — schedule slot,
         # point group, etc.). It's NOT units and NOT description — treating it
         # as units (as earlier parser versions did) mangles display and can
@@ -2424,17 +2424,17 @@ def _print_sweep_results(sweep_results: List[Dict], read_points: List,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Common TEC device name patterns to try during brute-force discovery.
-# These are common conventions across commercial BAS installations. Edit
-# this list to add your site's naming conventions for faster discovery.
+# This is a generic starter set covering naming conventions seen broadly
+# across commercial BAS installations. It is deliberately conservative;
+# many sites use site-specific prefixes (e.g. perimeter-VAV series, suite
+# numbering, tenant-prefixed devices) that the integrator established at
+# commissioning time. Edit this list to add your site's naming conventions
+# for faster discovery — the more accurate the seed list, the faster cold
+# discovery converges.
 DISCOVERY_DEVICE_PATTERNS = [
-    # PW series (perimeter VAVs)
-    *[f"PW{n}" for n in range(401, 451)],
-    *[f"PW{n}A" for n in range(401, 420)],
-    # Interior VAV series (common names across sites)
+    # Interior VAV series
     *[f"IVV{n}" for n in range(1, 21)],
     *[f"IV{n}" for n in range(1, 21)],
-    # K series (suites)
-    *[f"K{n}" for n in range(400, 451)],
     # AC/AH series (AHUs)
     *[f"AC{n:02d}" for n in range(1, 20)],
     *[f"AH{n:02d}" for n in range(1, 20)],
@@ -2450,7 +2450,7 @@ DISCOVERY_DEVICE_PATTERNS = [
     # Common generic points
     "OATEMP", "OAT",
     # Floor-based naming patterns
-    *[f"FLR{n}VAV{v}" for n in range(1, 21) for v in range(1, 6)],
+    *[f"FLR{n}VAV{v}" for n in range(1, 16) for v in range(1, 6)],
     # Common VAV naming: V followed by numbers
     *[f"V{n}" for n in range(1, 51)],
     *[f"VAV{n}" for n in range(1, 51)],
@@ -2458,9 +2458,8 @@ DISCOVERY_DEVICE_PATTERNS = [
     # Zone controllers
     *[f"ZN{n}" for n in range(1, 31)],
     *[f"ZONE{n}" for n in range(1, 21)],
-    # Room-based naming
+    # Room-based naming (generic step-100 series)
     *[f"RM{n}" for n in range(100, 500, 100)],
-    *[f"RM{n}" for n in range(401, 451)],
     # Suite-based
     *[f"STE{n}" for n in range(100, 500, 100)],
     *[f"SUITE{n}" for n in range(1, 21)],
@@ -2482,8 +2481,11 @@ DISCOVERY_DEVICE_PATTERNS = [
 ]
 
 # Panel-level point names (not TECs, but readable from nodes).
-# Generic starting set of common patterns. Missing point names are harmless
-# (the scanner just gets no data for them). Edit this list to add the custom
+# Conservative starter set covering Siemens factory defaults and broadly-
+# common BAS conventions. Many panels expose site-specific custom points
+# (zone-prefixed, tenant-prefixed, integrator-specific PPCL globals, lighting
+# schedules) that vary per deployment. Missing point names are harmless —
+# the scanner just gets no data for them. Edit this list to add the custom
 # panel points used at your site for richer panel-level discovery results.
 PANEL_POINT_NAMES = [
     # Outside air / weather (common naming conventions across BAS)
@@ -2492,35 +2494,19 @@ PANEL_POINT_NAMES = [
     # System-wide setpoints and statuses
     "HEAT.LOCKOUT", "COOL.RELEASE", "CWDFP",
     "HEAT.LOCKOUT.BN", "COOL.RELEASE.BN", "CWDFP.BN",
-    # Common prefixes for zone/bay/boiler/chiller points
-    "BAY.DP", "BAY.OCC", "BAY.SAT", "BAY.MAT", "BAY.RAT", "BAY.RAH",
-    "BOA.DP",
-    # Boiler common patterns
-    "BLRST", "BLRSTPT", "BLRST.BAC", "BLRSTPT.BAC",
+    # Boiler common patterns (BLR{n} alarm/enable/status)
+    "BLRST", "BLRSTPT",
     *[f"BLR{n}ALM" for n in range(1, 5)],
     *[f"BLR{n}ENB" for n in range(1, 5)],
     *[f"BLR{n}ST"  for n in range(1, 5)],
-    *[f"BLR{n}ALM.BAC" for n in range(1, 5)],
-    *[f"BLR{n}ENB.BAC" for n in range(1, 5)],
-    *[f"BLR{n}ST.BAC"  for n in range(1, 5)],
     # Chiller common patterns
     *[f"CH{n}ALM"  for n in range(1, 5)],
     *[f"CH{n}ENB"  for n in range(1, 5)],
     *[f"CH{n}ST"   for n in range(1, 5)],
-    # Floor-level points (generic patterns across multi-story buildings)
-    *[f"FLOOR {n:02d} AREA BOP"       for n in range(1, 21)],
-    *[f"FLOOR {n:02d} AREA BOP_1_BAC" for n in range(1, 21)],
-    *[f"FLOOR {n:02d} AREA BOP_2_BAC" for n in range(1, 21)],
-    *[f"FLOOR_{n:02d}_AREA_BOP"       for n in range(1, 21)],
-    *[f"FL{n:02d}.SAT"                for n in range(1, 21)],
-    *[f"FL{n:02d}.RAT"                for n in range(1, 21)],
     # Exhaust fan enables / statuses
     *[f"EF{n}_ENABLE" for n in range(1, 21)],
     *[f"EF{n}_STATUS" for n in range(1, 21)],
     *[f"EF{n}.ENABLE" for n in range(1, 21)],
-    # Lighting schedules (.OCC suffix = "Occupied mode" — standard BAS term)
-    *[f"LIGHTING.FL{n:02d}.OCC" for n in range(1, 21)],
-    *[f"LIGHT.FL{n:02d}.SS"     for n in range(1, 21)],
 ]
 
 
@@ -2529,11 +2515,11 @@ def parse_ip_range(range_str: str) -> List[str]:
     Parse flexible IP range formats into a list of IPs.
 
     Supported formats:
-        10.0.0.50              Single IP
-        10.0.0.1-254            Last octet range
-        10.0.0.0/24             CIDR notation
-        10.0.0                  Shorthand for .1-.254
-        10.0.0.0/24,10.20.0.0/24   Comma-separated multiple ranges
+        192.0.2.50              Single IP
+        192.0.2.1-254            Last octet range
+        192.0.2.0/24             CIDR notation
+        192.0.2                 Shorthand for .1-.254
+        192.0.2.0/24,198.51.100.0/24   Comma-separated multiple ranges
     """
     ips = []
     for part in range_str.split(','):
@@ -2557,7 +2543,7 @@ def parse_ip_range(range_str: str) -> List[str]:
                     ips.append(f"{octets[0]}.{octets[1]}.{octets[2]}.{i}")
 
         elif '-' in part.split('.')[-1]:
-            # Range in last octet: 10.0.0.1-254
+            # Range in last octet: 192.0.2.1-254
             base = '.'.join(part.split('.')[:-1])
             range_part = part.split('.')[-1]
             start, end = range_part.split('-')
@@ -2565,7 +2551,7 @@ def parse_ip_range(range_str: str) -> List[str]:
                 ips.append(f"{base}.{i}")
 
         elif part.count('.') == 2:
-            # Shorthand subnet: 10.0.0 → 10.0.0.1-254
+            # Shorthand subnet: 192.0.2 → 192.0.2.1-254
             for i in range(1, 255):
                 ips.append(f"{part}.{i}")
 
@@ -3581,7 +3567,7 @@ def discover_panel_points(host: str, node_name: str) -> List[Dict]:
     return found
 
 
-def discover_network(ip_ranges: str = "10.0.0", scan_ports: bool = True,
+def discover_network(ip_ranges: str = "192.0.2", scan_ports: bool = True,
                      scan_devices: bool = True, scan_panel: bool = False,
                      scan_info: bool = False, verify: str = None,
                      read_all: bool = False, output_format: str = "table",
@@ -4705,18 +4691,18 @@ Examples:
   %(prog)s --pcap capture.pcapng --save site.json
 
   # FIRST TIME — Discover with known network name, save config
-  %(prog)s --discover --range 10.0.0.0/24 --network MYBLN --save site.json
+  %(prog)s --discover --range 192.0.2.0/24 --network MYBLN --save site.json
 
   # AFTER SETUP — Use saved config (no --network needed)
   %(prog)s --config site.json --discover --skip-portscan
   %(prog)s --config site.json -n NODE1 -d DEVICE1 --quick
 
   # OR — Just use --network directly every time
-  %(prog)s --discover --range 10.0.0.0/24 --network MYBLN
-  %(prog)s -n 10.0.0.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN
+  %(prog)s --discover --range 192.0.2.0/24 --network MYBLN
+  %(prog)s -n 192.0.2.50 -d DEVICE1 -p "ROOM TEMP" --network MYBLN
 
   # Discover + read every point on every device
-  %(prog)s --network MYBLN --discover --range 10.0.0.0/24 --read-all
+  %(prog)s --network MYBLN --discover --range 192.0.2.0/24 --read-all
 
   # Get node firmware info
   %(prog)s --config site.json -n NODE1 --info
@@ -4725,7 +4711,7 @@ Examples:
   %(prog)s --config site.json --discover --skip-portscan --info
 
   # Multiple subnets (multiple buildings)
-  %(prog)s --discover --range 10.0.0.0/24 --range 172.16.0.0/24 --network MYBLN
+  %(prog)s --discover --range 192.0.2.0/24 --range 198.51.100.0/24 --network MYBLN
 
   # Decode a pcap file
   %(prog)s --pcap capture.pcapng
@@ -4749,16 +4735,16 @@ Known nodes: """ + ', '.join(f"{n}={ip}" for n, ip in sorted(KNOWN_NODES.items()
     parser.add_argument('--quick', '-q', action='store_true', help='Quick scan (key points only)')
     parser.add_argument('--discover', action='store_true', help='Discover nodes and devices')
     parser.add_argument('--range', '-r', action='append',
-                       help='IP range to scan. Formats: 10.0.0.0/24, 10.0.0.1-254, '
-                            '10.0.0, or single IP. Can specify multiple times.')
+                       help='IP range to scan. Formats: 192.0.2.0/24, 192.0.2.1-254, '
+                            '192.0.2, or single IP. Can specify multiple times.')
     parser.add_argument('--skip-portscan', action='store_true',
                        help='Skip port scan during discovery (use known nodes)')
     parser.add_argument('--with-panel', action='store_true',
                        help='Also scan panel-level points during discovery')
     parser.add_argument('--read-all', action='store_true',
                        help='Read all points on every discovered device')
-    parser.add_argument('--subnet', default='10.0.0',
-                       help='(deprecated, use --range) Subnet to scan (default: 10.0.0)')
+    parser.add_argument('--subnet', default='192.0.2',
+                       help='(deprecated, use --range) Subnet to scan (default: 192.0.2)')
     parser.add_argument('--network', help='P2 network name (auto-learned if not set)')
     parser.add_argument('--scanner-name', default=None,
                        help=f'Scanner identity on P2 network (overrides config; default from config or {SCANNER_NAME!r})')

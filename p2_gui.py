@@ -527,7 +527,7 @@ class MainWindow:
         range_str = simpledialog.askstring(
             "Port Scan",
             "IP range to scan for PXC (TCP/5033):\n\n"
-            "Formats:  10.0.0.50  |  10.0.0.80-200  |  10.0.0.0/24  |  10.0.0",
+            "Formats:  192.0.2.50  |  192.0.2.80-200  |  192.0.2.0/24  |  192.0.2",
             parent=self.root,
         )
         if not range_str:

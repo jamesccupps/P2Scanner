@@ -64,13 +64,13 @@ No pip packages required for the scanner itself.
 ### Cold onboarding (no prior knowledge)
 
 ```bash
-python p2_scanner.py --cold-discover --range 192.168.1.0/24 --save site.json
+python p2_scanner.py --cold-discover --range 192.0.2.0/24 --save site.json
 ```
 
 ### Known BLN name
 
 ```bash
-python p2_scanner.py --discover --range 192.168.1.0/24 --network MYBLN --save site.json
+python p2_scanner.py --discover --range 192.0.2.0/24 --network MYBLN --save site.json
 ```
 
 ### Read a point
@@ -104,13 +104,13 @@ Common commands shown below. Full flag list: `python p2_scanner.py --help`.
 
 ```bash
 # Default cold discovery (BACnet recon + dictionary probe)
-python p2_scanner.py --cold-discover --range 192.168.1.0/24 --save site.json
+python p2_scanner.py --cold-discover --range 192.0.2.0/24 --save site.json
 
 # Conservative (2-second delay between probes — safe during production hours)
-python p2_scanner.py --cold-discover --range 192.168.1.0/24 --cold-delay 2
+python p2_scanner.py --cold-discover --range 192.0.2.0/24 --cold-delay 2
 
 # Passive multicast listen (no probes sent)
-python p2_scanner.py --listen 60 --save site.json
+python p2_scanner.py --listen-push 60 --save site.json
 
 # Learn BLN name from a packet capture
 python p2_scanner.py --pcap capture.pcapng --save site.json
@@ -147,7 +147,7 @@ python p2_scanner.py --config site.json -n NODE1 -d DEVICE1 -f json > out.json
 
 ### IP range formats
 
-`10.0.0.50` · `10.0.0.0/24` · `10.0.0.80-200` · `10.0.0` (shorthand for `.1-254`) · comma-separated ranges.
+`192.0.2.50` · `192.0.2.0/24` · `192.0.2.80-200` · `192.0.2` (shorthand for `.1-254`) · comma-separated ranges.
 
 ---
 
@@ -198,8 +198,8 @@ Table output shows Desigo-style `(slot) NAME` for each point. Digital points ren
   "p2_site": "SITE",
   "scanner_name": "P2SCAN|5034",
   "known_nodes": {
-    "NODE1": "192.168.1.10",
-    "NODE2": "192.168.1.11"
+    "NODE1": "192.0.2.10",
+    "NODE2": "192.0.2.11"
   }
 }
 ```
@@ -220,7 +220,7 @@ import p2_scanner as p2
 p2.P2_NETWORK = "MYBLN"
 p2.SCANNER_NAME = "P2SCAN|5034"
 
-conn = p2.P2Connection("192.168.1.50")
+conn = p2.P2Connection("192.0.2.50")
 if conn.connect("NODE1"):
     result = conn.read_point("DEVICE1", "ROOM TEMP", "NODE1")
     print(result['value'], result.get('units'))
