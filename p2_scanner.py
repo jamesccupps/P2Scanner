@@ -3092,124 +3092,127 @@ def enumerate_fln_devices(host: str, node_name: str) -> List[Dict]:
         print(f"    [ERROR] Connection failed: {e}")
         return []
 
-    net = (P2_NETWORK if P2_NETWORK else "P2NET").encode('ascii')
-    scanner = SCANNER_NAME.encode('ascii')
-    site = (P2_SITE if P2_SITE else "SITE").encode('ascii')
-    node_lower = node_name.lower().encode('ascii')
+    try:
 
-    # Build both dialect variants of the handshake and probe to see which the
-    # PXC wants. See _probe_dialect() for why this exists.
-    routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
-    identity = (
-        b'\x46\x40\x01\x00' + bytes([len(scanner)]) + scanner +
-        b'\x01\x00' + bytes([len(site)]) + site +
-        b'\x01\x00' + bytes([len(net)]) + net +
-        # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
-        # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
-        # See PROTOCOL.md "Connection handshake" for the documented format.
-        b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
-        struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
-    )
-    # Random 24-bit seq matches real Desigo behavior — see PROTOCOL.md
-    # "Sequence number field". Both dialect probes share the seq so they
-    # look like alternative attempts of one handshake.
-    _hs_seq = secrets.randbits(24)
-    hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, _hs_seq) + routing + identity
-    hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, _hs_seq) + routing + identity
+        net = (P2_NETWORK if P2_NETWORK else "P2NET").encode('ascii')
+        scanner = SCANNER_NAME.encode('ascii')
+        site = (P2_SITE if P2_SITE else "SITE").encode('ascii')
+        node_lower = node_name.lower().encode('ascii')
 
-    dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
-    if dialect is None:
-        s.close()
-        print(f"    [ERROR] Handshake failed")
-        return []
+        # Build both dialect variants of the handshake and probe to see which the
+        # PXC wants. See _probe_dialect() for why this exists.
+        routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
+        identity = (
+            b'\x46\x40\x01\x00' + bytes([len(scanner)]) + scanner +
+            b'\x01\x00' + bytes([len(site)]) + site +
+            b'\x01\x00' + bytes([len(net)]) + net +
+            # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
+            # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
+            # See PROTOCOL.md "Connection handshake" for the documented format.
+            b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
+            struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
+        )
+        # Random 24-bit seq matches real Desigo behavior — see PROTOCOL.md
+        # "Sequence number field". Both dialect probes share the seq so they
+        # look like alternative attempts of one handshake.
+        _hs_seq = secrets.randbits(24)
+        hs_0x33 = struct.pack('>III', 12 + len(routing) + len(identity), 0x33, _hs_seq) + routing + identity
+        hs_0x34 = struct.pack('>III', 12 + len(routing) + len(identity), 0x34, _hs_seq) + routing + identity
 
-    cursor = "*"
-    seq = 2000
+        dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
+        if dialect is None:
+            s.close()
+            print(f"    [ERROR] Handshake failed")
+            return []
 
-    for iteration in range(200):
-        seq += 1
-        cb = cursor.encode('ascii')
-        enum_data = (struct.pack('>H', 0x0986) +
-                     b'\x00\x00\x00' + struct.pack('>H', 1) + b'*' +
-                     b'\x00\x00\x00' + struct.pack('>H', len(cb)) + cb)
-        enum_routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
-        msg = struct.pack('>III', 12 + len(enum_routing) + len(enum_data), dialect, seq) + enum_routing + enum_data
+        cursor = "*"
+        seq = 2000
+
+        for iteration in range(200):
+            seq += 1
+            cb = cursor.encode('ascii')
+            enum_data = (struct.pack('>H', 0x0986) +
+                         b'\x00\x00\x00' + struct.pack('>H', 1) + b'*' +
+                         b'\x00\x00\x00' + struct.pack('>H', len(cb)) + cb)
+            enum_routing = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
+            msg = struct.pack('>III', 12 + len(enum_routing) + len(enum_data), dialect, seq) + enum_routing + enum_data
         
-        try:
-            s.sendall(msg)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            break
+            try:
+                s.sendall(msg)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
         
-        s.settimeout(3)
-        data = b""
-        try:
-            while True:
-                chunk = s.recv(4096)
-                if not chunk: break
-                data += chunk
-                s.settimeout(0.5)
-        except socket.timeout: pass
+            s.settimeout(3)
+            data = b""
+            try:
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk: break
+                    data += chunk
+                    s.settimeout(0.5)
+            except socket.timeout: pass
         
-        if not data or len(data) <= 55:
-            break
-        if data[12] == 0x05:
-            break
+            if not data or len(data) <= 55:
+                break
+            if data[12] == 0x05:
+                break
         
-        # Parse: skip P2 header + routing, extract length-prefixed strings
-        payload = data[12:]
-        pos = 1
-        nulls = 0
-        while pos < len(payload) and nulls < 4:
-            if payload[pos] == 0: nulls += 1
-            pos += 1
+            # Parse: skip P2 header + routing, extract length-prefixed strings
+            payload = data[12:]
+            pos = 1
+            nulls = 0
+            while pos < len(payload) and nulls < 4:
+                if payload[pos] == 0: nulls += 1
+                pos += 1
         
-        if pos >= len(payload): break
-        data_area = payload[pos:]
+            if pos >= len(payload): break
+            data_area = payload[pos:]
         
-        # Extract all length-prefixed strings from data area
-        strings = []
-        i = 0
-        while i < len(data_area) - 2:
-            slen = struct.unpack('>H', data_area[i:i+2])[0]
-            if 0 < slen < 60 and i + 2 + slen <= len(data_area):
-                try:
-                    st = data_area[i+2:i+2+slen].decode('ascii')
-                    if st.isprintable():
-                        strings.append(st)
-                        i += 2 + slen
-                        continue
-                except Exception: pass
-            i += 1
+            # Extract all length-prefixed strings from data area
+            strings = []
+            i = 0
+            while i < len(data_area) - 2:
+                slen = struct.unpack('>H', data_area[i:i+2])[0]
+                if 0 < slen < 60 and i + 2 + slen <= len(data_area):
+                    try:
+                        st = data_area[i+2:i+2+slen].decode('ascii')
+                        if st.isprintable():
+                            strings.append(st)
+                            i += 2 + slen
+                            continue
+                    except Exception: pass
+                i += 1
         
-        routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE, node_name.upper(), node_name.lower()}
-        device_strings = [st for st in strings if st not in routing_set]
+            routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE, node_name.upper(), node_name.lower()}
+            device_strings = [st for st in strings if st not in routing_set]
         
-        if not device_strings:
-            break
+            if not device_strings:
+                break
         
-        dev_name = device_strings[0]
-        # Description is the last unique string that differs from device name
-        # Response contains: [device_name, device_name, internal_name, display_name]
-        # We want the display name (last one)
-        desc = ''
-        for st in device_strings[1:]:
-            if st != dev_name:
-                desc = st  # keep overwriting — last one wins
+            dev_name = device_strings[0]
+            # Description is the last unique string that differs from device name
+            # Response contains: [device_name, device_name, internal_name, display_name]
+            # We want the display name (last one)
+            desc = ''
+            for st in device_strings[1:]:
+                if st != dev_name:
+                    desc = st  # keep overwriting — last one wins
         
-        if dev_name == cursor:
-            break  # End of list
+            if dev_name == cursor:
+                break  # End of list
         
-        found.append({
-            'device': dev_name,
-            'description': desc,
-            'application': 0,
-        })
-        sys.stdout.write(f"\r    \u2713 {dev_name:<20s}  {desc}\n")
-        sys.stdout.flush()
+            found.append({
+                'device': dev_name,
+                'description': desc,
+                'application': 0,
+            })
+            sys.stdout.write(f"\r    \u2713 {dev_name:<20s}  {desc}\n")
+            sys.stdout.flush()
         
-        cursor = dev_name
+            cursor = dev_name
     
-    s.close()
+    finally:
+        s.close()
     sys.stdout.write(f"\r    Enumerate complete: {len(found)} devices found{'':20s}\n")
     return found
 
@@ -3402,151 +3405,154 @@ def discover_devices_on_node(host: str, node_name: str,
         print(f"    [ERROR] Connection failed: {e}")
         return []
 
-    net = (P2_NETWORK if P2_NETWORK else "P2NET").encode('ascii')
-    scanner = SCANNER_NAME.encode('ascii')
-    site = (P2_SITE if P2_SITE else "SITE").encode('ascii')
-    node_lower = node_name.lower().encode('ascii')
+    try:
 
-    # Build both dialect variants for probe.
-    routing_hb = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
-    identity = (
-        b'\x46\x40' +
-        b'\x01\x00' + bytes([len(scanner)]) + scanner +
-        b'\x01\x00' + bytes([len(site)]) + site +
-        b'\x01\x00' + bytes([len(net)]) + net +
-        # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
-        # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
-        # See PROTOCOL.md "Connection handshake" for the documented format.
-        b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
-        struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
-    )
-    hb_payload = routing_hb + identity
-    _hs_seq = secrets.randbits(24)  # See PROTOCOL.md "Sequence number field"
-    hs_0x33 = struct.pack('>III', 12 + len(hb_payload), 0x33, _hs_seq) + hb_payload
-    hs_0x34 = struct.pack('>III', 12 + len(hb_payload), 0x34, _hs_seq) + hb_payload
+        net = (P2_NETWORK if P2_NETWORK else "P2NET").encode('ascii')
+        scanner = SCANNER_NAME.encode('ascii')
+        site = (P2_SITE if P2_SITE else "SITE").encode('ascii')
+        node_lower = node_name.lower().encode('ascii')
 
-    dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
-    if dialect is None:
-        s.close()
-        print(f"    [ERROR] Handshake failed")
-        return []
+        # Build both dialect variants for probe.
+        routing_hb = b'\x00' + net + b'\x00' + node_lower + b'\x00' + net + b'\x00' + scanner + b'\x00'
+        identity = (
+            b'\x46\x40' +
+            b'\x01\x00' + bytes([len(scanner)]) + scanner +
+            b'\x01\x00' + bytes([len(site)]) + site +
+            b'\x01\x00' + bytes([len(net)]) + net +
+            # Trailer: separator + 3 flags + 5 reserved + 4-byte timestamp +
+            # 2-byte session id (00 00 = panel-style) + trailing null = 16 bytes.
+            # See PROTOCOL.md "Connection handshake" for the documented format.
+            b'\x00\x01\x01\x00\x00\x00\x00\x00\x00' +
+            struct.pack('>I', int(time.time())) + b'\x00\x00\x00'
+        )
+        hb_payload = routing_hb + identity
+        _hs_seq = secrets.randbits(24)  # See PROTOCOL.md "Sequence number field"
+        hs_0x33 = struct.pack('>III', 12 + len(hb_payload), 0x33, _hs_seq) + hb_payload
+        hs_0x34 = struct.pack('>III', 12 + len(hb_payload), 0x34, _hs_seq) + hb_payload
 
-    total = len(candidates)
-    base_seq = 5000
-    num_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+        dialect = _probe_dialect(s, hs_0x33, hs_0x34, host=host)
+        if dialect is None:
+            s.close()
+            print(f"    [ERROR] Handshake failed")
+            return []
 
-    for batch_num in range(num_batches):
-        batch_start = batch_num * BATCH_SIZE
-        batch_end = min(batch_start + BATCH_SIZE, total)
-        batch = candidates[batch_start:batch_end]
+        total = len(candidates)
+        base_seq = 5000
+        num_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 
-        sys.stdout.write(f"\r    Probing: {batch_end}/{total}{'':20s}")
-        sys.stdout.flush()
+        for batch_num in range(num_batches):
+            batch_start = batch_num * BATCH_SIZE
+            batch_end = min(batch_start + BATCH_SIZE, total)
+            batch = candidates[batch_start:batch_end]
 
-        # Build and send this batch
-        seq_map = {}
-        batch_msgs = b""
-        for i, dev in enumerate(batch):
-            seq = base_seq + batch_start + i
-            seq_map[seq] = dev
-            dev_bytes = dev.encode('ascii')
-            routing = (b'\x00' + net + b'\x00' + node_lower + b'\x00' +
-                       net + b'\x00' + scanner + b'\x00')
-            read_data = (
-                b'\x02\x71\x00\x00' +
-                b'\x01\x00' + bytes([len(dev_bytes)]) + dev_bytes +
-                b'\x01\x00\x0bAPPLICATION' +
-                b'\x00\xff'
-            )
-            payload = routing + read_data
-            msg = struct.pack('>III', 12 + len(payload), dialect, seq) + payload
-            batch_msgs += msg
+            sys.stdout.write(f"\r    Probing: {batch_end}/{total}{'':20s}")
+            sys.stdout.flush()
 
-        try:
-            s.sendall(batch_msgs)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            break
+            # Build and send this batch
+            seq_map = {}
+            batch_msgs = b""
+            for i, dev in enumerate(batch):
+                seq = base_seq + batch_start + i
+                seq_map[seq] = dev
+                dev_bytes = dev.encode('ascii')
+                routing = (b'\x00' + net + b'\x00' + node_lower + b'\x00' +
+                           net + b'\x00' + scanner + b'\x00')
+                read_data = (
+                    b'\x02\x71\x00\x00' +
+                    b'\x01\x00' + bytes([len(dev_bytes)]) + dev_bytes +
+                    b'\x01\x00\x0bAPPLICATION' +
+                    b'\x00\xff'
+                )
+                payload = routing + read_data
+                msg = struct.pack('>III', 12 + len(payload), dialect, seq) + payload
+                batch_msgs += msg
 
-        # Collect responses for this batch
-        all_data = b""
-        s.settimeout(2)
-        try:
-            while True:
-                chunk = s.recv(16384)
-                if not chunk:
-                    break
-                all_data += chunk
-                s.settimeout(0.3)
-        except socket.timeout:
-            pass
-        except (ConnectionResetError, OSError):
-            break
-
-        # Parse responses
-        pos = 0
-        while pos < len(all_data) - 12:
-            if len(all_data) - pos < 12:
+            try:
+                s.sendall(batch_msgs)
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 break
-            msg_len = struct.unpack('>I', all_data[pos:pos+4])[0]
-            if msg_len < 12 or msg_len > len(all_data) - pos:
-                pos += 1
-                continue
-            msg_data = all_data[pos:pos+msg_len]
-            pos += msg_len
-            if len(msg_data) < 13:
-                continue
-            resp_seq = struct.unpack('>I', msg_data[8:12])[0]
-            resp_flag = msg_data[12]
-            if resp_flag != 1 or resp_seq not in seq_map:
-                continue
-            dev_name = seq_map[resp_seq]
-            if len(msg_data) <= 55:
-                continue
 
-            # Try standard parser (3FFFFF flags)
-            flags_idx = -1
-            for fi in range(12, len(msg_data) - 3):
-                if msg_data[fi] == 0x3F and msg_data[fi+1] == 0xFF and msg_data[fi+2] == 0xFF:
-                    flags_idx = fi
+            # Collect responses for this batch
+            all_data = b""
+            s.settimeout(2)
+            try:
+                while True:
+                    chunk = s.recv(16384)
+                    if not chunk:
+                        break
+                    all_data += chunk
+                    s.settimeout(0.3)
+            except socket.timeout:
+                pass
+            except (ConnectionResetError, OSError):
+                break
+
+            # Parse responses
+            pos = 0
+            while pos < len(all_data) - 12:
+                if len(all_data) - pos < 12:
                     break
-            if flags_idx >= 0:
-                after_flags = msg_data[flags_idx + 3:]
-                if len(after_flags) >= 8:
-                    raw_val = after_flags[4:8]
-                    app_num = int(struct.unpack('>f', raw_val)[0])
-                    desc = ''
-                    lp_strings = P2Connection._extract_lp_strings(msg_data[12:flags_idx])
+                msg_len = struct.unpack('>I', all_data[pos:pos+4])[0]
+                if msg_len < 12 or msg_len > len(all_data) - pos:
+                    pos += 1
+                    continue
+                msg_data = all_data[pos:pos+msg_len]
+                pos += msg_len
+                if len(msg_data) < 13:
+                    continue
+                resp_seq = struct.unpack('>I', msg_data[8:12])[0]
+                resp_flag = msg_data[12]
+                if resp_flag != 1 or resp_seq not in seq_map:
+                    continue
+                dev_name = seq_map[resp_seq]
+                if len(msg_data) <= 55:
+                    continue
+
+                # Try standard parser (3FFFFF flags)
+                flags_idx = -1
+                for fi in range(12, len(msg_data) - 3):
+                    if msg_data[fi] == 0x3F and msg_data[fi+1] == 0xFF and msg_data[fi+2] == 0xFF:
+                        flags_idx = fi
+                        break
+                if flags_idx >= 0:
+                    after_flags = msg_data[flags_idx + 3:]
+                    if len(after_flags) >= 8:
+                        raw_val = after_flags[4:8]
+                        app_num = int(struct.unpack('>f', raw_val)[0])
+                        desc = ''
+                        lp_strings = P2Connection._extract_lp_strings(msg_data[12:flags_idx])
+                        routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE,
+                                      node_name.upper(), node_name.lower()}
+                        data_strs = [st for st in lp_strings if st not in routing_set
+                                   and st.upper() != 'APPLICATION']
+                        if len(data_strs) >= 2:
+                            desc = data_strs[1]
+                        found.append({
+                            'device': dev_name,
+                            'application': app_num,
+                            'description': desc,
+                        })
+                        sys.stdout.write(f"\r    \u2713 {dev_name:<20s}  APP={app_num}  {desc}\n")
+                        sys.stdout.flush()
+                else:
+                    # Fallback: device responded but different format (UC, PTEC, etc)
+                    # Extract description from any length-prefixed strings
+                    lp_strings = P2Connection._extract_lp_strings(msg_data[12:])
                     routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE,
-                                  node_name.upper(), node_name.lower()}
+                                  node_name.upper(), node_name.lower(), 'APPLICATION'}
                     data_strs = [st for st in lp_strings if st not in routing_set
-                               and st.upper() != 'APPLICATION']
-                    if len(data_strs) >= 2:
-                        desc = data_strs[1]
+                               and st != dev_name]
+                    desc = data_strs[0] if data_strs else ''
                     found.append({
                         'device': dev_name,
-                        'application': app_num,
+                        'application': 0,
                         'description': desc,
                     })
-                    sys.stdout.write(f"\r    \u2713 {dev_name:<20s}  APP={app_num}  {desc}\n")
+                    sys.stdout.write(f"\r    \u2713 {dev_name:<20s}  (non-TEC)  {desc}\n")
                     sys.stdout.flush()
-            else:
-                # Fallback: device responded but different format (UC, PTEC, etc)
-                # Extract description from any length-prefixed strings
-                lp_strings = P2Connection._extract_lp_strings(msg_data[12:])
-                routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE,
-                              node_name.upper(), node_name.lower(), 'APPLICATION'}
-                data_strs = [st for st in lp_strings if st not in routing_set
-                           and st != dev_name]
-                desc = data_strs[0] if data_strs else ''
-                found.append({
-                    'device': dev_name,
-                    'application': 0,
-                    'description': desc,
-                })
-                sys.stdout.write(f"\r    \u2713 {dev_name:<20s}  (non-TEC)  {desc}\n")
-                sys.stdout.flush()
 
-    s.close()
+    finally:
+        s.close()
     sys.stdout.write(f"\r    Device scan complete: {len(found)} TECs found{'':30s}\n")
     return found
 
