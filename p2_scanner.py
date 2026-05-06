@@ -664,7 +664,7 @@ class P2Connection:
         finally:
             if self.sock:
                 try: self.sock.settimeout(original_timeout)
-                except: pass
+                except Exception: pass
 
         if resp is not None:
             # Confirm the response msg_type — this is what the panel wants us
@@ -699,7 +699,7 @@ class P2Connection:
         if self.sock:
             try:
                 self.sock.close()
-            except:
+            except Exception:
                 pass
             self.sock = None
 
@@ -1054,7 +1054,7 @@ class P2Connection:
                             strings.append(s)
                             i += 3 + slen
                             continue
-                    except:
+                    except Exception:
                         pass
             # Pattern: 00 01 00 [len] [string]
             if (i < len(data) - 4 and data[i] == 0x00 and data[i+1] == 0x01
@@ -1067,7 +1067,7 @@ class P2Connection:
                             strings.append(s)
                             i += 4 + slen
                             continue
-                    except:
+                    except Exception:
                         pass
             i += 1
         return strings
@@ -2074,7 +2074,7 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
         port_on_wire = 5033 if (dport == 5033 or sport == 5033) else 5034
         try:
             raw = bytes.fromhex(parts[5])
-        except:
+        except Exception:
             continue
 
         # Parse potentially multiple P2 messages in one TCP segment
@@ -2137,7 +2137,7 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
                     if name_len > 0 and len(after) >= 7 + name_len + 7:
                         try:
                             pt_name = after[7:7+name_len].decode('ascii')
-                        except:
+                        except Exception:
                             pt_name = None
                         if pt_name and pt_name.isprintable():
                             val_area = after[7+name_len:]
@@ -2592,7 +2592,7 @@ def port_scan_p2(ip_list: List[str], timeout: float = 0.5) -> List[str]:
                 found.append(ip)
                 sys.stdout.write(f"\r  {ip} — P2 OPEN                    \n")
                 sys.stdout.flush()
-        except:
+        except Exception:
             pass
 
     sys.stdout.write(f"\r  Scan complete: {len(found)} P2 hosts found{'':30s}\n")
@@ -2674,7 +2674,7 @@ def sniff_network_name(duration: int = 10, interface: str = None) -> Optional[st
         print(f"    Captured {os.path.getsize(tmpfile)} bytes, parsing...")
         try:
             sniff_pcap(tmpfile, "table")
-        except:
+        except Exception:
             pass
 
         if P2_NETWORK:
@@ -2698,14 +2698,14 @@ def sniff_network_name(duration: int = 10, interface: str = None) -> Optional[st
                                     P2_NETWORK = s
                                     print(f"    Learned network name: {P2_NETWORK}")
                                     return P2_NETWORK
-                            except:
+                            except Exception:
                                 pass
                             buf = b""
                         elif 32 <= raw[j] < 127:
                             buf += bytes([raw[j]])
                         else:
                             buf = b""
-        except:
+        except Exception:
             pass
 
         return None
@@ -2722,7 +2722,7 @@ def sniff_network_name(duration: int = 10, interface: str = None) -> Optional[st
     finally:
         try:
             os.unlink(tmpfile)
-        except:
+        except Exception:
             pass
 
 
@@ -2814,7 +2814,7 @@ def probe_p2_host(host: str) -> Optional[Dict[str, str]]:
                 if buf:
                     try:
                         null_strings.append(buf.decode('ascii'))
-                    except:
+                    except Exception:
                         null_strings.append("")
                     buf = b""
                     if len(null_strings) >= 4:
@@ -2857,7 +2857,7 @@ def probe_p2_host(host: str) -> Optional[Dict[str, str]]:
                         st = resp_payload[i+3:i+3+slen].decode('ascii')
                         if st.isprintable():
                             lp_strings.append(st)
-                    except:
+                    except Exception:
                         pass
                     i += 3 + slen
                     continue
@@ -2970,7 +2970,7 @@ def get_node_info(host: str, node_name: str) -> Optional[Dict]:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(3)
         s.connect((host, P2_PORT))
-    except:
+    except Exception:
         return None
 
     net = (P2_NETWORK if P2_NETWORK else "P2NET").encode('ascii')
@@ -3045,7 +3045,7 @@ def get_node_info(host: str, node_name: str) -> Optional[Dict]:
                         strings.append(st)
                         i += 2 + slen
                         continue
-                except: pass
+                except Exception: pass
             i += 1
 
         routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE, node_name.upper(), node_name.lower()}
@@ -3057,7 +3057,7 @@ def get_node_info(host: str, node_name: str) -> Optional[Dict]:
             'extra': info_strings[2] if len(info_strings) > 2 else '',
             'raw_strings': info_strings,
         }
-    except:
+    except Exception:
         s.close()
         return None
 
@@ -3178,7 +3178,7 @@ def enumerate_fln_devices(host: str, node_name: str) -> List[Dict]:
                         strings.append(st)
                         i += 2 + slen
                         continue
-                except: pass
+                except Exception: pass
             i += 1
         
         routing_set = {P2_NETWORK, SCANNER_NAME, P2_SITE, node_name.upper(), node_name.lower()}
