@@ -4544,6 +4544,14 @@ def listen_for_push_notifications(port: int = 5034, duration: Optional[int] = No
     """
     import threading
     import json as _json
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Cap concurrent peer connections so a misconfigured supervisor or a
+    # flood from a hostile peer can't spawn unbounded threads. 32 is well
+    # above any realistic site (a typical BLN has 5–20 panels feeding the
+    # supervisor on 5034); excess connections queue in the executor and
+    # are handled as workers free up.
+    MAX_PEER_THREADS = 32
 
     out_lock = threading.Lock()
     out_stream = open(output_file, 'a', buffering=1) if output_file else None
@@ -4651,7 +4659,8 @@ def listen_for_push_notifications(port: int = 5034, duration: Optional[int] = No
     print()
 
     start = time.time()
-    threads = []
+    executor = ThreadPoolExecutor(max_workers=MAX_PEER_THREADS,
+                                   thread_name_prefix='p2-5034')
     try:
         while True:
             if duration is not None and (time.time() - start) >= duration:
@@ -4660,13 +4669,15 @@ def listen_for_push_notifications(port: int = 5034, duration: Optional[int] = No
                 csock, peer = srv.accept()
             except socket.timeout:
                 continue
-            t = threading.Thread(target=handle_connection, args=(csock, peer), daemon=True)
-            t.start()
-            threads.append(t)
+            executor.submit(handle_connection, csock, peer)
     except KeyboardInterrupt:
         print("\n  Stopped.")
     finally:
         srv.close()
+        # Don't wait — handle_connection's per-peer reads have their own
+        # timeouts and any in-flight work will exit on its own. wait=False
+        # gives Ctrl-C its expected snappy behavior.
+        executor.shutdown(wait=False)
         if out_stream:
             out_stream.close()
 
