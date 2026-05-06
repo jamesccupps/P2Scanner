@@ -743,6 +743,14 @@ class P2Connection:
             # Parse the total length from the header
             total_len = struct.unpack('>I', self._recv_buffer[:4])[0]
 
+            # Sanity-check the length. P2 frames are bounded; an unbounded
+            # value here means either framing desync or a hostile peer sending
+            # a forged length field. Either way, refusing to read 4GB into
+            # memory is the right move. Same threshold as the 5034 listener.
+            if total_len < 12 or total_len > 65536:
+                self._recv_buffer = b''
+                return None
+
             # Read until we have the full message
             while len(self._recv_buffer) < total_len:
                 chunk = self.sock.recv(4096)
@@ -2076,8 +2084,12 @@ def sniff_pcap(pcap_file: str, output_format: str = "table") -> List[Dict]:
             if remaining < 12:
                 break
             total_len = struct.unpack('>I', raw[pos:pos+4])[0]
+            # Malformed frame (length under 12 = invalid; over remaining =
+            # truncated/forged). Stop parsing this segment rather than
+            # consuming whatever's left as one giant fake frame — that would
+            # corrupt subsequent iteration state and could panic the parser.
             if total_len < 12 or total_len > remaining:
-                total_len = remaining
+                break
             msg = raw[pos:pos+total_len]
             pos += total_len
 
