@@ -1,0 +1,45 @@
+# Local site config — never commit real BLN names or panel IPs
+site.local.json
+panel_points.local.json
+*.local.json
+
+# Packet captures contain protocol traffic, point names, BLN identifiers — keep out of public repo
+*.pcap
+*.pcapng
+*.cap
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / scanner output
+*.log
+scan_*.csv
+scan_*.json
+push_events.txt
+
+# Worktrees / sandboxes
+.claude/worktrees/

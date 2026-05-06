@@ -1,0 +1,29 @@
+# Default: text files normalize to LF in the repo, native EOL on checkout.
+* text=auto
+
+# Shell scripts MUST be LF — bash on Linux fails with "bash\r: command not found"
+# if the shebang has CRLF endings. This is the C2 fix from the Phase 0 audit.
+*.sh        text eol=lf
+
+# Windows batch files MUST be CRLF — cmd.exe gets confused by LF-only .bat
+# files (e.g., reports "p2_gui.py not found" with the file actually present).
+*.bat       text eol=crlf
+
+# Python is platform-neutral; let git normalize.
+*.py        text
+
+# Markdown / docs are text.
+*.md        text
+*.json      text
+*.lua       text
+
+# Binary blobs — never normalize.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.pcap      binary
+*.pcapng    binary
+*.cap       binary
