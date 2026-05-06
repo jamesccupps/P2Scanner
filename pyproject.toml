@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p2_scanner"
+version = "1.0.0"
+description = "Scanner and read-only point library for Siemens APOGEE P2 protocol"
+readme = "README.md"
+requires-python = ">=3.6"
+license = {file = "LICENSE"}
+authors = [{name = "James Cupps"}]
+keywords = ["bacnet", "apogee", "siemens", "hvac", "building-automation", "p2"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking :: Monitoring",
+]
+# No external dependencies — pure stdlib by design. Honored explicitly here
+# so a `pip install .` doesn't pull in anything surprising.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/jamesccupps/P2Scanner"
+Repository = "https://github.com/jamesccupps/P2Scanner"
+Documentation = "https://github.com/jamesccupps/P2Scanner/blob/main/PROTOCOL.md"
+
+[project.scripts]
+p2_scanner = "p2_scanner:main"
+
+[project.gui-scripts]
+p2_gui = "p2_gui:main"
+
+[tool.setuptools]
+# Single-file modules at the repo root; no package directory.
+py-modules = ["p2_scanner", "p2_gui", "p2_gui_widgets", "p2_gui_workers", "analyze_pcap"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+# Ship the TEC point database alongside the module so `import p2_scanner`
+# can find it without the user manually copying files.
+"*" = ["tecpoints.json"]
