@@ -1426,7 +1426,11 @@ class SweepResultsWindow(tk.Toplevel):
         # Quick filter
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Label(toolbar, text="Filter:").pack(side="left", padx=(0, 4))
-        self._filter_var = tk.StringVar()
+        # master=self so the StringVar (and its trace callback) get cleaned
+        # up when the window is destroyed — without it, repeatedly opening
+        # and closing this window leaks one trace + one closure-over-self
+        # per session.
+        self._filter_var = tk.StringVar(master=self)
         self._filter_var.trace_add("write", lambda *a: self._render())
         ttk.Entry(toolbar, textvariable=self._filter_var, width=24).pack(side="left")
 
@@ -2638,7 +2642,8 @@ class WalkPointsWindow(tk.Toplevel):
             side="left", fill="y", padx=10
         )
         ttk.Label(toolbar, text="Filter:").pack(side="left", padx=(0, 4))
-        self._filter_var = tk.StringVar()
+        # master=self anchors the trace lifetime to this window
+        self._filter_var = tk.StringVar(master=self)
         self._filter_var.trace_add("write", lambda *a: self._render())
         ttk.Entry(toolbar, textvariable=self._filter_var, width=24).pack(side="left")
 
@@ -2826,7 +2831,8 @@ class ProgramsWindow(tk.Toplevel):
             side="left", fill="y", padx=10
         )
         ttk.Label(toolbar, text="Find in source:").pack(side="left", padx=(0, 4))
-        self._find_var = tk.StringVar()
+        # master=self anchors the trace lifetime to this window
+        self._find_var = tk.StringVar(master=self)
         self._find_var.trace_add("write", lambda *a: self._find_in_source())
         find_entry = ttk.Entry(toolbar, textvariable=self._find_var, width=24)
         find_entry.pack(side="left")
